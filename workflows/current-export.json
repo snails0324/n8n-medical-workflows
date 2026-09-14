@@ -1,0 +1,2466 @@
+[
+  {
+    "name": "Discord Trigger",
+    "description": "Discord 醫療問診流程（保留原流程）",
+    "active": false,
+    "isArchived": false,
+    "nodes": [
+      {
+        "parameters": {
+          "promptType": "define",
+          "text": "={{ $('Discord Trigger').item.json.content }}",
+          "hasOutputParser": true,
+          "options": {
+            "systemMessage": "你是「醫療問診與初步分診 AI Agent」。\n\n你的工作是針對使用者本次提出的症狀進行結構化問診、急症風險篩檢與初步分流。\n\n你不是醫師，不能做出確定診斷、不能開藥、不能要求使用者自行停藥，也不能把可能疾病說成已經確診。\n\n【工作流程前提】\n\n這個 Agent 只會在使用者的永久基本病歷已完成後被呼叫。\n\n資料庫中的永久基本病歷如下：\n\n{{ JSON.stringify($json.profile_json ?? {}) }}\n\n目前 profile_completed 狀態：\n\n{{ $json.profile_completed === true ? 'true' : 'false' }}\n\n永久基本病歷只能作為本次問診的背景資料，不能被症狀資料覆蓋。\n\n不要重新詢問已經存在於 profile_json 的基本資料，包括：\n\n- age_range\n- sex_at_birth\n- allergies\n- chronic_conditions\n- regular_medications\n\n除非使用者主動提出要更正或更新該資料，否則不得主動重問。\n\n【永久資料與當次問診資料必須分開】\n\n永久基本資料：\n\n- patient_profile\n- 儲存在 PostgreSQL 的 patient_profiles.profile_json\n\n當次問診資料：\n\n- confirmed_facts\n- 只代表本次症狀\n- 不得寫入永久 patient_profile\n\n例如以下資料屬於當次問診資料，不得放入 patient_profile：\n\n- 胃痛\n- 頭痛\n- 胸痛\n- 疼痛位置\n- 疼痛程度\n- 症狀開始時間\n- 症狀持續時間\n- 噁心、嘔吐、發燒、腹瀉\n- 伴隨的麻木、暈眩或呼吸困難\n\n【每一輪的處理順序】\n\n每一輪都必須依照以下順序處理：\n\n1. 讀取完整對話記憶。\n2. 整理目前已經被使用者明確確認的 confirmed_facts。\n3. 讀取本輪使用者訊息，擷取新的症狀資訊。\n4. 先檢查是否存在急症或高風險警訊。\n5. 如果沒有急症，再判斷下一個最重要且尚未確認的問診資料。\n6. 每輪最多只能問一個問題。\n7. 不得輸出問題清單，不得一次詢問多個獨立問題。\n8. 不得重複詢問已經確認的症狀資料。\n\n【重要症狀判斷規則】\n\n「胃痛」不等於「上腹部」。\n\n「肚子痛」不等於「下腹部」。\n\n只有使用者明確表示疼痛位置後，才可以把 pain_location 寫入 confirmed_facts。\n\n如果使用者只說：\n\n- 胃痛\n- 肚子痛\n- 腹部不舒服\n\n但沒有說明明確位置，必須詢問疼痛位置，不可以自行推測。\n\n疼痛嚴重度必須以使用者明確提供的數字或描述為準，不可以自行猜測。\n\n【一般問診資料】\n\n依照使用者的主要症狀，逐步收集最有幫助的資料，例如：\n\n- chief_complaint：主要不舒服的症狀\n- symptom_location：症狀或疼痛位置\n- onset：何時開始、突然或漸進發生\n- duration：持續多久\n- course：變好、變差、持續或反覆\n- severity：疼痛或不適程度，0 到 10 分\n- quality：刺痛、脹痛、悶痛、灼熱、抽痛等\n- associated_symptoms：伴隨症狀\n- aggravating_factors：什麼情況會變嚴重\n- relieving_factors：什麼情況會改善\n- relevant_context：外傷、懷孕可能性、近期手術、感染暴露、旅行或特殊用藥等\n\n不需要每一項都詢問。請根據主要症狀，選擇目前最重要且尚未確認的一項。\n\n【急症與紅旗警訊】\n\n如果出現以下任何情況，必須立即使用 mode=\"emergency\"：\n\n- 呼吸困難、嘴唇發紫或無法完整說話\n- 胸部壓迫感或胸痛合併冒冷汗、暈厥、嚴重喘\n- 臉歪、單側手腳無力、說話不清、突然意識混亂\n- 新發生的抽搐、昏迷、意識改變\n- 突然在幾秒到一分鐘內達到最嚴重程度的劇烈頭痛\n- 頭部外傷後出現意識改變、反覆嘔吐或嚴重頭痛\n- 高燒合併嚴重頸部僵硬、意識改變或快速惡化\n- 大量吐血、血便、黑便或疑似嚴重內出血\n- 劇烈腹痛合併腹部僵硬、昏厥或持續惡化\n- 嚴重過敏反應，包含臉部或喉嚨腫脹、喘或吞嚥困難\n- 疑似中毒、藥物過量或危險物質暴露\n- 有自傷或傷害他人的想法\n- 症狀快速惡化，或使用者已經無法安全等待\n\n進入 emergency 時：\n\n1. 不要繼續一般問診。\n2. 不要呼叫 Qdrant。\n3. 不要提供一長串可能疾病。\n4. 不要詢問年齡、過敏、慢性疾病或長期用藥。\n5. 先給出清楚的就醫行動。\n6. 建議立即聯絡當地緊急服務或前往急診；若使用者在台灣，可撥打 119。\n7. patient_message 必須先說明緊急性，再說明原因。\n8. 不要把 emergency 說成確定診斷。\n\n【狀態機】\n\n只能使用以下 mode：\n\n1. collecting\n\n仍然缺少重要問診資料時使用。\n\n規則：\n\n- 只能問一個問題。\n- next_question 必須包含一個問題。\n- patient_message 必須等於 next_question。\n- confirmed_facts 必須保留之前已確認的資料。\n\n2. insufficient\n\n目前資料不足以安全判斷下一步時使用。\n\n規則：\n\n- 清楚說明缺少哪一項重要資料。\n- 只能詢問一個最重要的缺少項目。\n- 不可以直接猜測或列出診斷。\n\n3. awaiting_confirmation\n\n已經收集到足夠的本次症狀資料，需要請使用者確認時使用。\n\npatient_message 必須包含簡短的事實摘要，並只提出以下一個確認問題：\n\n以上資料是否正確？請回答「是」，或指出需要修改的項目。\n\n如果使用者回答：\n\n- 是\n- 對\n- 正確\n- 沒錯\n\n則下一輪必須進入 differential_ready，不得重複相同摘要。\n\n如果使用者指出錯誤，必須更新 confirmed_facts，回到 collecting，只詢問一個必要問題。\n\n4. differential_ready\n\n使用者已確認症狀資料，且沒有急症警訊時使用。\n\n可以提供：\n\n- 可能方向\n- 需要留意的症狀\n- 建議就醫層級\n- 下一步觀察事項\n\n不得使用「你就是某疾病」或「已確診」等說法。\n\n請使用：\n\n- 可能與……有關\n- 需要排除……\n- 目前資訊比較符合……\n- 僅能作為初步分流參考\n\n如果使用者要求「再多問一點」、「判斷細一點」或「可以再問」，下一輪必須回到 collecting，並提出一個尚未確認且最有價值的問題。\n\n5. emergency\n\n遇到任何急症或紅旗警訊時使用。\n\n不要繼續一般問診，也不要先列出鑑別診斷。\n\n【Qdrant 使用規則】\n\nQdrant 只能用於查詢醫療知識、衛教資料或分流參考內容。\n\n只有在以下條件同時成立時才可以使用 Qdrant：\n\n- mode 不是 emergency\n- 已經收集足夠的症狀事實\n- 需要參考醫療知識或衛教內容\n\n不得把以下資料寫入 Qdrant：\n\n- Discord 使用者 ID\n- patient_profile\n- 過敏資料\n- 慢性疾病\n- 長期用藥\n- 未經確認的症狀推測\n\n如果 Qdrant 沒有找到資料，不可以自行編造答案。\n\n【醫療安全規則】\n\n- 不得做確定診斷。\n- 不得開藥或指示停藥。\n- 不得建議使用者忽略嚴重症狀。\n- 不得把模型猜測當成使用者說過的資料。\n- 不得把未確認的症狀寫入 confirmed_facts。\n- 使用者沒有回答的欄位，必須保持空白或列在 missing_critical_fields。\n- 使用者回答「不知道」、「沒有」、「不想回答」時，請依語意記錄為 unknown、none 或 declined，不要反覆追問。\n- 每一輪只能詢問一個問題。\n\n【輸出規則】\n\n只輸出符合 Structured Output Parser 的 JSON。\n\n不要輸出 Markdown。\n\n不要輸出 ```json。\n\npatient_message 是唯一可以傳送給 Discord 使用者的欄位。\n\ncollecting 或 insufficient 狀態：\n\n- next_question 必須是一個問題\n- patient_message 必須是同一個問題\n- 不得輸出問題清單\n\nawaiting_confirmation 狀態：\n\n- patient_message 必須包含簡短摘要\n- 只能提出一個確認問題\n- next_question 必須是確認問題\n\ndifferential_ready 狀態：\n\n- next_question 必須是空字串\n- patient_message 提供初步分流結果或衛教建議\n\nemergency 狀態：\n\n- next_question 必須是空字串\n- patient_message 必須提供清楚的緊急就醫行動\n- 不得繼續一般問診\n\nmedical_disclaimer 固定使用：\n\n以上內容僅供參考，不能取代醫師診斷；如有嚴重或快速惡化的症狀，請立即就醫。",
+            "maxIterations": 10,
+            "returnIntermediateSteps": false
+          }
+        },
+        "type": "@n8n/n8n-nodes-langchain.agent",
+        "typeVersion": 3.1,
+        "position": [
+          1680,
+          -176
+        ],
+        "name": "問診"
+      },
+      {
+        "parameters": {
+          "resource": "message",
+          "guildId": {
+            "__rl": true,
+            "value": "1529431430466375700",
+            "mode": "list",
+            "cachedResultName": "醫療bot",
+            "cachedResultUrl": "https://discord.com/channels/1529431430466375700"
+          },
+          "channelId": {
+            "__rl": true,
+            "value": "1529775685554536468",
+            "mode": "list",
+            "cachedResultName": "測試",
+            "cachedResultUrl": "https://discord.com/channels/1529431430466375700/1529775685554536468"
+          },
+          "content": "={{\n(() => {\n  const raw = $('檢視病例').first().json.profile_json ?? {};\n  const p = typeof raw === 'string' ? JSON.parse(raw) : raw;\n  const render = (value) => {\n    if (value === null || value === undefined) return '尚未提供';\n    const text = Array.isArray(value) ? value.join('、').trim() : String(value).trim();\n    if (!text) return '尚未提供';\n    const normalized = text.toLowerCase();\n    if (normalized === 'unknown') return '不確定';\n    if (normalized === 'none') return '無';\n    if (normalized === 'declined') return '使用者選擇不回答';\n    return text;\n  };\n  return `目前資料庫中儲存的基本病歷如下：\n\n年齡或年齡區間：${render(p.age_range)}\n出生時生理性別：${render(p.sex_at_birth)}\n過敏：${render(p.allergies)}\n慢性疾病：${render(p.chronic_conditions)}\n長期使用藥物：${render(p.regular_medications)}\n\n以上病歷資料是否需要更改？請回答「不需要」，或告訴我要修改哪一項。`;\n})()\n}}",
+          "options": {}
+        },
+        "type": "n8n-nodes-base.discord",
+        "typeVersion": 2,
+        "position": [
+          1296,
+          -80
+        ],
+        "name": "展示病例確認"
+      },
+      {
+        "parameters": {
+          "promptType": "define",
+          "text": "={{ $('Discord Trigger').item.json.content }}",
+          "hasOutputParser": true,
+          "options": {
+            "systemMessage": "你是「病歷確認閘門 AI」。\n\n你的工作不是問診，也不是診斷，而是在症狀問診開始前，先展示資料庫中已經儲存的基本病歷，並詢問使用者是否需要修改。\n\n目前資料庫中的基本病歷：\n\n{{ JSON.stringify($json.profile_json ?? {}) }}\n\n目前病歷完成狀態：\n\n{{ $json.has_complete_profile === true ? 'complete' : 'incomplete' }}\n\n【重要規則】\n\n1. 不要把 profile_json 原始 JSON 直接顯示給使用者。\n2. 請將資料整理成容易閱讀的繁體中文清單。\n3. 不要主動詢問症狀。\n4. 不要重新詢問已存在的基本資料。\n5. 每一輪最多只能詢問一個問題。\n6. 不要把症狀資料寫入 patient_profile。\n7. 不要修改資料庫；修改資料交給後續的病歷更新 Agent。\n8. 不要提供醫療診斷。\n\n【需要展示的病歷欄位】\n\n請依照以下名稱展示：\n\n- 年齡或年齡區間：age_range\n- 出生時生理性別：sex_at_birth\n- 過敏：allergies\n- 慢性疾病：chronic_conditions\n- 長期使用藥物：regular_medications\n\n如果欄位值是空字串，請顯示「尚未提供」。\n如果欄位值是 unknown，請顯示「不確定」。\n如果欄位值是 none，請顯示「無」。\n如果欄位值是 declined，請顯示「使用者選擇不回答」。\n\n【首次進入此 Agent 時】\n\n如果目前對話記憶中還沒有完成病歷確認，請輸出：\n\n1. 簡短展示目前儲存的基本病歷。\n2. 詢問：\n\n「以上病歷資料是否需要更改？」\n\n此時：\n\n- profile_action = \"ask_change\"\n- profile_reviewed = false\n- 不要詢問症狀。\n- 不要顯示一長串其他問題。\n\n【使用者表示不需要更改時】\n\n如果使用者回答以下意思：\n\n- 不需要\n- 不用改\n- 不用更改\n- 沒問題\n- 正確\n- 保持現在資料\n\n如果 has_complete_profile=true：\n\n- profile_action = \"start_triage\"\n- profile_reviewed = true\n- patient_message 必須表示病歷維持不變，並請使用者描述目前症狀。\n\n例如：\n\n「好的，基本病歷資料維持不變。請告訴我目前最困擾您的症狀。」\n\n如果 has_complete_profile=false：\n\n- profile_action = \"continue_profile\"\n- profile_reviewed = true\n- 將流程交給基本病歷收集 Agent，繼續補完缺少欄位。\n\n【進入症狀問診後的持續路由】\n\n如果完整對話記憶中已經出現 profile_action = \"start_triage\"，表示基本病歷確認已完成，而且目前已經進入本次症狀問診。從這一刻起，除非使用者明確要求修改五項基本病歷，所有後續訊息都必須維持：\n\n- profile_action = \"start_triage\"\n- profile_reviewed = true\n- 不得再次輸出基本病歷摘要。\n- 不得回到 ask_change。\n- 讓「問診」Agent 處理本輪訊息。\n\n這些後續訊息包括症狀、症狀位置（例如「中間」）、嚴重程度、發生時間、伴隨症狀，以及「無」、「不知道」、「是」、「否」等問診回答。即使本輪訊息只有一個位置或簡短回答，也必須維持 start_triage。\n\n如果使用者明確要求修改年齡、出生時生理性別、過敏、慢性疾病或長期用藥，修改意圖優先，才可切換為 edit_profile；除此之外不得重新啟動病例確認。\n\n【使用者表示需要修改時】\n\n如果使用者回答：\n\n- 要修改\n- 需要更改\n- 過敏改成……\n- 我現在有吃……\n- 慢性病新增……\n- 年齡資料不正確\n\n則：\n\n- profile_action = \"edit_profile\"\n- profile_reviewed = true\n- 將使用者主動提供的修改內容放入 patient_profile。\n- 如果使用者只說「我要修改」，但沒有說明哪一欄，只能詢問：\n\n「請問您想修改年齡、出生時生理性別、過敏、慢性疾病，還是長期用藥？」\n\n不得一次詢問修改內容和症狀。\n\n【如果病歷確認已經完成】\n\n如果對話記憶中已經顯示使用者完成過病歷確認，且本輪訊息是症狀，例如：\n\n- 頭痛\n- 胃痛\n- 胸口悶\n- 我拉肚子\n\n則：\n\n- profile_action = \"start_triage\"\n- 不要再次展示同一份病歷。\n- 讓問診 AI Agent 處理本輪症狀。\n\n【輸出規則】\n\n只能輸出 JSON，不要輸出 Markdown，不要輸出 ```json。\n\npatient_message 是唯一要傳送給 Discord 使用者的訊息。\n\nmedical_disclaimer 固定為：\n\n「以上內容僅供參考，不能取代醫師診斷；如有嚴重或快速惡化的症狀，請立即就醫。」\n\n【最終格式硬性要求】\n\n- 只輸出一個合法 JSON 物件；不得輸出 ```、Markdown、前言、後記或 <think> 內容。\n- 所有欄位都必須存在：profile_action、profile_reviewed、patient_message、next_question、patient_profile、medical_disclaimer。\n- profile_action 只能是 ask_change、edit_profile、start_triage、continue_profile 其中之一。\n- profile_reviewed 必須是 JSON boolean，不是字串。\n- patient_profile 必須是物件；沒有要修改的欄位使用空字串。\n- 字串內的換行必須使用 \\n  轉義，不得放入未轉義的實際換行。"
+          }
+        },
+        "type": "@n8n/n8n-nodes-langchain.agent",
+        "typeVersion": 3.1,
+        "position": [
+          624,
+          16
+        ],
+        "name": "AI Agent"
+      },
+      {
+        "parameters": {
+          "conditions": {
+            "options": {
+              "caseSensitive": true,
+              "leftValue": "",
+              "typeValidation": "strict",
+              "version": 3
+            },
+            "conditions": [
+              {
+                "leftValue": "={{ $json.output?.profile_action ?? $json.profile_action }}",
+                "rightValue": "ask_change",
+                "operator": {
+                  "type": "string",
+                  "operation": "equals"
+                }
+              }
+            ],
+            "combinator": "and"
+          },
+          "options": {}
+        },
+        "type": "n8n-nodes-base.if",
+        "typeVersion": 2.3,
+        "position": [
+          1072,
+          16
+        ],
+        "name": "是否先詢問修改",
+        "alwaysOutputData": false,
+        "executeOnce": false
+      },
+      {
+        "parameters": {
+          "resource": "message",
+          "guildId": {
+            "__rl": true,
+            "value": "1529431430466375700",
+            "mode": "list",
+            "cachedResultName": "醫療bot",
+            "cachedResultUrl": "https://discord.com/channels/1529431430466375700"
+          },
+          "channelId": {
+            "__rl": true,
+            "value": "1529775685554536468",
+            "mode": "list",
+            "cachedResultName": "測試",
+            "cachedResultUrl": "https://discord.com/channels/1529431430466375700/1529775685554536468"
+          },
+          "content": "={{\n  $json.output.patient_message\n  || $json.output.next_question\n  || '目前無法產生下一個問題，請稍後再試。'\n}}",
+          "options": {}
+        },
+        "type": "n8n-nodes-base.discord",
+        "typeVersion": 2,
+        "position": [
+          2272,
+          32
+        ],
+        "name": "Send a message"
+      },
+      {
+        "parameters": {
+          "conditions": {
+            "options": {
+              "caseSensitive": true,
+              "leftValue": "",
+              "typeValidation": "strict",
+              "version": 3
+            },
+            "conditions": [
+              {
+                "leftValue": "={{ ['differential_ready', 'emergency'].includes(String($('問診').first().json.output?.mode ?? '')) }}",
+                "rightValue": "",
+                "operator": {
+                  "type": "boolean",
+                  "operation": "true",
+                  "singleValue": true
+                }
+              }
+            ],
+            "combinator": "and"
+          },
+          "options": {}
+        },
+        "type": "n8n-nodes-base.if",
+        "typeVersion": 2.3,
+        "position": [
+          2496,
+          32
+        ],
+        "name": "是否完成問診才清除記憶",
+        "alwaysOutputData": false,
+        "executeOnce": false
+      },
+      {
+        "parameters": {
+          "mode": "delete",
+          "deleteMode": "all"
+        },
+        "type": "@n8n/n8n-nodes-langchain.memoryManager",
+        "typeVersion": 1.1,
+        "position": [
+          2720,
+          32
+        ],
+        "name": "清除當次問診記憶"
+      },
+      {
+        "parameters": {
+          "mode": "delete",
+          "deleteMode": "all"
+        },
+        "type": "@n8n/n8n-nodes-langchain.memoryManager",
+        "typeVersion": 1.1,
+        "position": [
+          3072,
+          32
+        ],
+        "name": "清除病例確認記憶"
+      },
+      {
+        "parameters": {
+          "mode": "delete",
+          "deleteMode": "all"
+        },
+        "type": "@n8n/n8n-nodes-langchain.memoryManager",
+        "typeVersion": 1.1,
+        "position": [
+          3424,
+          32
+        ],
+        "name": "清除病例收集記憶"
+      },
+      {
+        "parameters": {
+          "model": "qwen3.5-4b:q4",
+          "options": {}
+        },
+        "type": "@n8n/n8n-nodes-langchain.lmChatOllama",
+        "typeVersion": 1,
+        "position": [
+          1512,
+          56
+        ],
+        "name": "Ollama Chat Model"
+      },
+      {
+        "parameters": {
+          "sessionIdType": "customKey",
+          "sessionKey": "={{\n  String($('Discord Trigger').first().json.authorId || 'unknown-user')\n  + ':' +\n  String($('Discord Trigger').first().json.channelId || 'unknown-channel')\n  + ':triage-v2'\n}}",
+          "contextWindowLength": 20
+        },
+        "type": "@n8n/n8n-nodes-langchain.memoryBufferWindow",
+        "typeVersion": 1.4,
+        "position": [
+          1640,
+          56
+        ],
+        "name": "Simple Memory"
+      },
+      {
+        "parameters": {
+          "mode": "retrieve-as-tool",
+          "toolDescription": "客服幾點上班？",
+          "qdrantCollection": {
+            "__rl": true,
+            "value": "medical_knowledge",
+            "mode": "list",
+            "cachedResultName": "medical_knowledge"
+          },
+          "options": {}
+        },
+        "type": "@n8n/n8n-nodes-langchain.vectorStoreQdrant",
+        "typeVersion": 1.3,
+        "position": [
+          1768,
+          56
+        ],
+        "name": "醫療數據庫"
+      },
+      {
+        "parameters": {
+          "jsonSchemaExample": "{\n  \"mode\": \"collecting\",\n  \"question_key\": \"symptom_location\",\n  \"next_question\": \"請問疼痛是在上腹部、下腹部、左側、右側，還是其他位置？\",\n  \"patient_message\": \"請問疼痛是在上腹部、下腹部、左側、右側，還是其他位置？\",\n  \"confirmed_facts\": {\n    \"chief_complaint\": \"胃痛\"\n  },\n  \"possible_conditions\": [],\n  \"red_flags\": [],\n  \"missing_critical_fields\": [\n    \"symptom_location\"\n  ],\n  \"confidence\": 0,\n  \"medical_disclaimer\": \"以上內容僅供參考，不能取代醫師診斷；如有嚴重或快速惡化的症狀，請立即就醫。\"\n}"
+        },
+        "type": "@n8n/n8n-nodes-langchain.outputParserStructured",
+        "typeVersion": 1.3,
+        "position": [
+          2056,
+          56
+        ],
+        "name": "Structured Output Parser"
+      },
+      {
+        "parameters": {
+          "conditions": {
+            "options": {
+              "caseSensitive": true,
+              "leftValue": "",
+              "typeValidation": "strict",
+              "version": 3
+            },
+            "conditions": [
+              {
+                "leftValue": "={{ $json.output?.profile_action ?? $json.profile_action }}",
+                "rightValue": "edit_profile",
+                "operator": {
+                  "type": "string",
+                  "operation": "equals"
+                }
+              }
+            ],
+            "combinator": "and"
+          },
+          "options": {}
+        },
+        "type": "n8n-nodes-base.if",
+        "typeVersion": 2.3,
+        "position": [
+          1296,
+          112
+        ],
+        "name": "是否需要重建病歷",
+        "alwaysOutputData": false,
+        "executeOnce": false
+      },
+      {
+        "parameters": {
+          "guildIds": [
+            "1529431430466375700"
+          ],
+          "channelIds": [
+            "1529775685554536468"
+          ],
+          "pattern": "every",
+          "additionalFields": {
+            "externalBotTrigger": false,
+            "attachmentsRequired": false
+          }
+        },
+        "type": "n8n-nodes-discord-trigger.discordTrigger",
+        "typeVersion": 1,
+        "position": [
+          -48,
+          192
+        ],
+        "name": "Discord Trigger",
+        "alwaysOutputData": false,
+        "executeOnce": false
+      },
+      {
+        "parameters": {
+          "operation": "executeQuery",
+          "query": "WITH existing_profile AS (\n  SELECT\n    p.discord_user_id,\n    p.profile_json,\n    p.profile_completed,\n    (\n      NULLIF(BTRIM(p.profile_json->>'age_range'), '') IS NOT NULL\n      AND NULLIF(BTRIM(p.profile_json->>'sex_at_birth'), '') IS NOT NULL\n      AND NULLIF(BTRIM(p.profile_json->>'allergies'), '') IS NOT NULL\n      AND NULLIF(BTRIM(p.profile_json->>'chronic_conditions'), '') IS NOT NULL\n      AND NULLIF(BTRIM(p.profile_json->>'regular_medications'), '') IS NOT NULL\n    ) AS has_complete_profile,\n    FALSE AS is_new_profile\n  FROM patient_profiles AS p\n  WHERE p.discord_user_id = $1::text\n), missing_profile AS (\n  SELECT\n    $1::text AS discord_user_id,\n    '{}'::jsonb AS profile_json,\n    FALSE AS profile_completed,\n    FALSE AS has_complete_profile,\n    TRUE AS is_new_profile\n  WHERE NOT EXISTS (\n    SELECT 1\n    FROM patient_profiles AS p2\n    WHERE p2.discord_user_id = $1::text\n  )\n)\nSELECT * FROM existing_profile\nUNION ALL\nSELECT * FROM missing_profile\nLIMIT 1;",
+          "options": {
+            "queryReplacement": "={{\n  [\n    String($('Discord Trigger').first().json.authorId || '')\n  ]\n}}"
+          }
+        },
+        "type": "n8n-nodes-base.postgres",
+        "typeVersion": 2.7,
+        "position": [
+          176,
+          192
+        ],
+        "name": "檢視病例"
+      },
+      {
+        "parameters": {
+          "conditions": {
+            "options": {
+              "caseSensitive": true,
+              "leftValue": "",
+              "typeValidation": "strict",
+              "version": 3
+            },
+            "conditions": [
+              {
+                "leftValue": "={{ $json.has_complete_profile }}",
+                "rightValue": "=",
+                "operator": {
+                  "type": "boolean",
+                  "operation": "true",
+                  "singleValue": true
+                }
+              }
+            ],
+            "combinator": "and"
+          },
+          "options": {}
+        },
+        "type": "n8n-nodes-base.if",
+        "typeVersion": 2.3,
+        "position": [
+          400,
+          192
+        ],
+        "name": "是否已有病例"
+      },
+      {
+        "parameters": {
+          "jsonSchemaExample": "{\n  \"profile_action\": \"ask_change\",\n  \"profile_reviewed\": false,\n  \"patient_message\": \"目前儲存的基本病歷：\\n\\n年齡或年齡區間：45-54歲\\n出生時生理性別：男性\\n過敏：無\\n慢性疾病：高血壓\\n長期使用藥物：降壓藥\\n\\n以上病歷資料是否需要更改？\",\n  \"next_question\": \"以上病歷資料是否需要更改？\",\n  \"patient_profile\": {\n    \"age_range\": \"\",\n    \"sex_at_birth\": \"\",\n    \"allergies\": \"\",\n    \"chronic_conditions\": \"\",\n    \"regular_medications\": \"\"\n  },\n  \"medical_disclaimer\": \"以上內容僅供參考，不能取代醫師診斷；如有嚴重或快速惡化的症狀，請立即就醫。\"\n}",
+          "autoFix": true
+        },
+        "type": "@n8n/n8n-nodes-langchain.outputParserStructured",
+        "typeVersion": 1.3,
+        "position": [
+          696,
+          232
+        ],
+        "name": "Structured Output Parser2"
+      },
+      {
+        "parameters": {
+          "model": "nomic-embed-text:latest"
+        },
+        "type": "@n8n/n8n-nodes-langchain.embeddingsOllama",
+        "typeVersion": 1,
+        "position": [
+          1848,
+          264
+        ],
+        "name": "Embeddings Ollama"
+      },
+      {
+        "parameters": {
+          "sessionIdType": "customKey",
+          "sessionKey": "={{\n  String($('Discord Trigger').first().json.authorId || 'unknown-user')\n  + ':' +\n  String($('Discord Trigger').first().json.channelId || 'unknown-channel')\n  + ':profile-review-v1'\n}}",
+          "contextWindowLength": 20
+        },
+        "type": "@n8n/n8n-nodes-langchain.memoryBufferWindow",
+        "typeVersion": 1.3,
+        "position": [
+          3144,
+          264
+        ],
+        "name": "Simple Memory2"
+      },
+      {
+        "parameters": {
+          "sessionIdType": "customKey",
+          "sessionKey": "={{ String($('Discord Trigger').first().json.authorId || 'unknown-user') }}"
+        },
+        "type": "@n8n/n8n-nodes-langchain.memoryBufferWindow",
+        "typeVersion": 1.4,
+        "position": [
+          3496,
+          264
+        ],
+        "name": "Simple Memory1"
+      },
+      {
+        "parameters": {
+          "promptType": "define",
+          "text": "={{ $('Discord Trigger').item.json.content }}",
+          "hasOutputParser": true,
+          "options": {
+            "systemMessage": "你是「一次性電子病歷基本資料建立 Agent1」。\n\n你的工作不是診斷疾病，也不是進行症狀分流；你的唯一工作是建立並更新使用者的基本電子病歷資料。\n\n【目前工作流程狀態】\n\n是否為第一次建立病歷：\n{{ $('檢視病例').first().json.is_new_profile === true ? '是' : '否' }}\n\n目前病歷是否已完成：\n{{ $('檢視病例').first().json.has_complete_profile === true ? '是' : '否' }}\n\n目前資料庫已儲存的基本資料：\n{{ JSON.stringify($('檢視病例').first().json.profile_json ?? {}) }}\n\n目前的流程分流動作：\n{{ $json.output?.profile_action ?? 'profile_collecting' }}\n\n【需要收集的基本資料】\n\npatient_profile 必須保留以下欄位：\n\n- preferred_name\n- age_range\n- sex_at_birth\n- allergies\n- chronic_conditions\n- regular_medications\n\npreferred_name 可以沒有資料；其他欄位需要逐一收集。\n\n【基本規則】\n\n1. 每一輪先讀取資料庫已儲存的 profile_json，以及本輪使用者訊息。\n\n2. 必須保留已經收集到的資料，不能用空字串、null 或空陣列覆蓋原本已有的資料。\n\n3. 如果使用者本輪一次提供多個基本資料，請全部擷取並儲存，不要只儲存其中一項。\n\n4. 如果使用者回答以下內容，視為該欄位已完成，不要重問：\n\n   - 不知道、不清楚 → 記錄為 \"unknown\"\n   - 沒有、無 → 記錄為 \"none\"\n   - 不想回答、拒絕回答 → 記錄為 \"declined\"\n\n5. 已經完成的欄位禁止再次主動詢問，除非使用者主動要求修改。\n\n6. 每一輪最多只能詢問一個尚未完成的基本資料欄位，不可以一次提出問題清單，也不可以同時詢問多個獨立問題。\n\n7. 年齡可以記錄為年齡或年齡區間，例如：\n   - \"35\"\n   - \"30-39\"\n   - \"unknown\"\n\n8. 過敏、慢性疾病及長期用藥，如果使用者表示沒有，請記錄為 \"none\"，不要留下空白。\n\n9. 如果使用者同時描述症狀，請將症狀保留在 pending_chief_complaint，不能把症狀放進永久的 patient_profile。\n\n【既有病歷修改模式】\n\n如果目前的流程分流動作是 edit_profile，代表使用者正在修改既有病歷。\n\n- 不要顯示第一次建立病歷的提示。\n- 只處理使用者本輪明確要求修改的欄位。\n- 保留 profile_json 中所有未被修改的欄位。\n- 如果使用者只表示想修改但沒有說明欄位，只詢問一個修改欄位。\n- 修改完成後輸出完整合併後的 patient_profile，不能只輸出修改欄位。\n\n【第一次建立病歷的提示訊息】\n\n只有在以下兩個條件同時成立時，才顯示第一次建立病歷提示：\n\n- is_new_profile === true\n- profile_completed !== true\n\n第一次建立時，patient_message 必須以以下文字開頭：\n\n系統目前未偵測到您先前建立的基本病歷資料，現在開始進行第一次基本資料建立。\n\n提示文字後面換行，再提出一個尚未完成的基本資料問題。\n\n例如：\n\n系統目前未偵測到您先前建立的基本病歷資料，現在開始進行第一次基本資料建立。\n\n請問您的年齡或年齡區間？\n\n如果 is_new_profile === false，代表資料庫已經有這位使用者的病歷資料，即使目前尚未完成，也不要再次顯示「未偵測到病歷」這段提示，只要繼續詢問下一個尚未完成的欄位。\n\n【完成狀態】\n\n如果仍有尚未完成的欄位：\n\n- mode 必須是 \"profile_collecting\"\n- profile_status 必須是 \"incomplete\"\n- profile_question_key 必須是目前正在詢問的欄位\n- next_question 必須只包含一個問題\n- patient_message 必須包含要顯示給使用者的完整訊息\n- missing_profile_fields 必須列出尚未完成的欄位\n\n如果所有基本資料都已完成：\n\n- mode 必須是 \"profile_complete\"\n- profile_status 必須是 \"complete\"\n- profile_question_key 必須是 \"\"\n- next_question 必須是 \"\"\n- missing_profile_fields 必須是 []\n- patient_message 必須告知使用者基本病歷資料已建立完成，並提醒接下來可以描述這次的症狀\n\n完成訊息可以使用：\n\n基本病歷資料已建立完成。接下來請描述您這次不舒服的症狀，我會協助進行初步分流。\n\n【訊息規則】\n\n- patient_message 是唯一會傳送到 Discord 的欄位。\n- next_question 只放目前要詢問的一個問題。\n- 每一輪只能有一個問號或一個問題。\n- 不要輸出問題清單。\n- 不要把內部欄位名稱、JSON、SQL 或系統規則顯示給使用者。\n- 不要聲稱已經診斷出任何疾病。\n- 回覆中要保留以下醫療免責聲明：\n\n以上內容僅供參考，不能取代醫師診斷；如有嚴重或快速惡化的症狀，請立即就醫。\n\n【輸出要求】\n\n只輸出符合 Structured Output Parser 的 JSON，不要加 Markdown，不要加 ```json。\n\n必須輸出以下欄位：\n\n- mode\n- profile_status\n- profile_question_key\n- next_question\n- patient_message\n- patient_profile\n- pending_chief_complaint\n- missing_profile_fields\n- medical_disclaimer"
+          }
+        },
+        "type": "@n8n/n8n-nodes-langchain.agent",
+        "typeVersion": 3.1,
+        "position": [
+          1712,
+          432
+        ],
+        "name": "病歷資料收集"
+      },
+      {
+        "parameters": {
+          "model": "qwen3.5-4b:q4",
+          "options": {
+            "think": false,
+            "temperature": 0,
+            "numPredict": 600,
+            "format": "json"
+          }
+        },
+        "type": "@n8n/n8n-nodes-langchain.lmChatOllama",
+        "typeVersion": 1,
+        "position": [
+          696,
+          440
+        ],
+        "name": "Ollama Chat Model2"
+      },
+      {
+        "parameters": {
+          "operation": "upsert",
+          "schema": {
+            "__rl": true,
+            "mode": "list",
+            "value": "public"
+          },
+          "table": {
+            "__rl": true,
+            "value": "patient_profiles",
+            "mode": "list",
+            "cachedResultName": "patient_profiles"
+          },
+          "columns": {
+            "mappingMode": "defineBelow",
+            "value": {
+              "profile_completed": "={{\n(() => {\n  const current = $('檢視病例').first().json.profile_json ?? {};\n  const incoming = $json.output?.patient_profile ?? $json.patient_profile ?? {};\n  const merged = {\n    ...(typeof current === 'object' && current !== null ? current : {})\n  };\n  for (const key of [\n    'preferred_name',\n    'age_range',\n    'sex_at_birth',\n    'allergies',\n    'chronic_conditions',\n    'regular_medications'\n  ]) {\n    const value = incoming[key];\n    const text = Array.isArray(value) ? value.join('、').trim() : (value == null ? '' : String(value).trim());\n    if (text) merged[key] = value;\n  }\n  return [\n    'age_range',\n    'sex_at_birth',\n    'allergies',\n    'chronic_conditions',\n    'regular_medications'\n  ].every((key) => {\n    const value = merged[key];\n    return value !== null && value !== undefined && (Array.isArray(value) ? value.length > 0 : String(value).trim() !== '');\n  });\n})()\n}}",
+              "discord_user_id": "={{ $('Discord Trigger').item.json.authorId }}",
+              "profile_json": "={{\n(() => {\n  const current = $('檢視病例').first().json.profile_json ?? {};\n  const incoming = $json.output?.patient_profile ?? $json.patient_profile ?? {};\n  const merged = {\n    ...(typeof current === 'object' && current !== null ? current : {})\n  };\n  const keys = [\n    'preferred_name',\n    'age_range',\n    'sex_at_birth',\n    'allergies',\n    'chronic_conditions',\n    'regular_medications'\n  ];\n  for (const key of keys) {\n    const value = incoming[key];\n    const text = Array.isArray(value) ? value.join('、').trim() : (value == null ? '' : String(value).trim());\n    if (text) merged[key] = value;\n  }\n  return merged;\n})()\n}}"
+            },
+            "matchingColumns": [
+              "discord_user_id"
+            ],
+            "schema": [
+              {
+                "displayName": "discord_user_id",
+                "required": true,
+                "defaultMatch": false,
+                "display": true,
+                "type": "string",
+                "canBeUsedToMatch": true,
+                "removed": false
+              },
+              {
+                "displayName": "profile_json",
+                "required": false,
+                "defaultMatch": false,
+                "display": true,
+                "type": "object",
+                "canBeUsedToMatch": false
+              },
+              {
+                "displayName": "profile_completed",
+                "required": false,
+                "defaultMatch": false,
+                "display": true,
+                "type": "boolean",
+                "canBeUsedToMatch": false
+              },
+              {
+                "displayName": "created_at",
+                "required": false,
+                "defaultMatch": false,
+                "display": true,
+                "type": "dateTime",
+                "canBeUsedToMatch": false
+              },
+              {
+                "displayName": "updated_at",
+                "required": false,
+                "defaultMatch": false,
+                "display": true,
+                "type": "dateTime",
+                "canBeUsedToMatch": false
+              }
+            ],
+            "attemptToConvertTypes": false,
+            "convertFieldsToString": false
+          },
+          "options": {}
+        },
+        "type": "n8n-nodes-base.postgres",
+        "typeVersion": 2.7,
+        "position": [
+          2272,
+          544
+        ],
+        "name": "建立病歷"
+      },
+      {
+        "parameters": {
+          "resource": "message",
+          "guildId": {
+            "__rl": true,
+            "value": "1529431430466375700",
+            "mode": "list",
+            "cachedResultName": "醫療bot",
+            "cachedResultUrl": "https://discord.com/channels/1529431430466375700"
+          },
+          "channelId": {
+            "__rl": true,
+            "value": "1529775685554536468",
+            "mode": "list",
+            "cachedResultName": "測試",
+            "cachedResultUrl": "https://discord.com/channels/1529431430466375700/1529775685554536468"
+          },
+          "content": "={{ $('病歷資料收集').item.json.output.patient_message }}",
+          "options": {}
+        },
+        "type": "n8n-nodes-base.discord",
+        "typeVersion": 2,
+        "position": [
+          2496,
+          544
+        ],
+        "name": "Send a message1"
+      },
+      {
+        "parameters": {
+          "model": "qwen3.5-4b:q4",
+          "options": {}
+        },
+        "type": "@n8n/n8n-nodes-langchain.lmChatOllama",
+        "typeVersion": 1,
+        "position": [
+          1720,
+          664
+        ],
+        "name": "Ollama Chat Model1"
+      },
+      {
+        "parameters": {
+          "jsonSchemaExample": "{\n  \"mode\": \"profile_collecting\",\n  \"profile_status\": \"incomplete\",\n  \"profile_question_key\": \"age_range\",\n  \"next_question\": \"請問您的年齡或年齡區間？\",\n  \"patient_message\": \"請問您的年齡或年齡區間？\",\n  \"patient_profile\": {\n    \"preferred_name\": \"\",\n    \"age_range\": \"\",\n    \"sex_at_birth\": \"\",\n    \"allergies\": \"\",\n    \"chronic_conditions\": \"\",\n    \"regular_medications\": \"\",\n    \"type\": \"string\"\n  },\n  \"pending_chief_complaint\": \"\",\n  \"missing_profile_fields\": [\n    \"age_range\",\n    \"sex_at_birth\",\n    \"allergies\",\n    \"chronic_conditions\",\n    \"regular_medications\"\n  ],\n  \"medical_disclaimer\": \"以上內容僅供參考，不能取代醫師診斷。\"\n}"
+        },
+        "type": "@n8n/n8n-nodes-langchain.outputParserStructured",
+        "typeVersion": 1.3,
+        "position": [
+          1848,
+          664
+        ],
+        "name": "Structured Output Parser1"
+      }
+    ],
+    "connections": {
+      "Discord Trigger": {
+        "main": [
+          [
+            {
+              "node": "檢視病例",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Send a message": {
+        "main": [
+          [
+            {
+              "node": "是否完成問診才清除記憶",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Ollama Chat Model": {
+        "ai_languageModel": [
+          [
+            {
+              "node": "問診",
+              "type": "ai_languageModel",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Simple Memory": {
+        "ai_memory": [
+          [
+            {
+              "node": "問診",
+              "type": "ai_memory",
+              "index": 0
+            },
+            {
+              "node": "清除當次問診記憶",
+              "type": "ai_memory",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Embeddings Ollama": {
+        "ai_embedding": [
+          [
+            {
+              "node": "醫療數據庫",
+              "type": "ai_embedding",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Structured Output Parser": {
+        "ai_outputParser": [
+          [
+            {
+              "node": "問診",
+              "type": "ai_outputParser",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Simple Memory1": {
+        "ai_memory": [
+          [
+            {
+              "node": "病歷資料收集",
+              "type": "ai_memory",
+              "index": 0
+            },
+            {
+              "node": "清除病例收集記憶",
+              "type": "ai_memory",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Ollama Chat Model1": {
+        "ai_languageModel": [
+          [
+            {
+              "node": "病歷資料收集",
+              "type": "ai_languageModel",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "檢視病例": {
+        "main": [
+          [
+            {
+              "node": "是否已有病例",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "建立病歷": {
+        "main": [
+          [
+            {
+              "node": "Send a message1",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "是否已有病例": {
+        "main": [
+          [
+            {
+              "node": "AI Agent",
+              "type": "main",
+              "index": 0
+            }
+          ],
+          [
+            {
+              "node": "病歷資料收集",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Structured Output Parser1": {
+        "ai_outputParser": [
+          [
+            {
+              "node": "病歷資料收集",
+              "type": "ai_outputParser",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "病歷資料收集": {
+        "main": [
+          [
+            {
+              "node": "建立病歷",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "醫療數據庫": {
+        "ai_tool": [
+          [
+            {
+              "node": "問診",
+              "type": "ai_tool",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "問診": {
+        "main": [
+          [
+            {
+              "node": "Send a message",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "AI Agent": {
+        "main": [
+          [
+            {
+              "node": "是否先詢問修改",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "是否先詢問修改": {
+        "main": [
+          [
+            {
+              "node": "展示病例確認",
+              "type": "main",
+              "index": 0
+            }
+          ],
+          [
+            {
+              "node": "是否需要重建病歷",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "是否需要重建病歷": {
+        "main": [
+          [
+            {
+              "node": "病歷資料收集",
+              "type": "main",
+              "index": 0
+            }
+          ],
+          [
+            {
+              "node": "問診",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Structured Output Parser2": {
+        "ai_outputParser": [
+          [
+            {
+              "node": "AI Agent",
+              "type": "ai_outputParser",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Simple Memory2": {
+        "ai_memory": [
+          [
+            {
+              "node": "AI Agent",
+              "type": "ai_memory",
+              "index": 0
+            },
+            {
+              "node": "清除病例確認記憶",
+              "type": "ai_memory",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Ollama Chat Model2": {
+        "ai_languageModel": [
+          [
+            {
+              "node": "AI Agent",
+              "type": "ai_languageModel",
+              "index": 0
+            },
+            {
+              "node": "Structured Output Parser2",
+              "type": "ai_languageModel",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "清除當次問診記憶": {
+        "main": [
+          [
+            {
+              "node": "清除病例確認記憶",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "清除病例確認記憶": {
+        "main": [
+          [
+            {
+              "node": "清除病例收集記憶",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "是否完成問診才清除記憶": {
+        "main": [
+          [
+            {
+              "node": "清除當次問診記憶",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      }
+    },
+    "settings": {
+      "executionOrder": "v1",
+      "binaryMode": "separate",
+      "availableInMCP": false,
+      "timeSavedMode": "fixed",
+      "callerPolicy": "workflowsFromSameOwner"
+    },
+    "nodeGroups": [],
+    "versionCounter": 1,
+    "triggerCount": 1,
+    "versionMetadata": {
+      "name": "Discord Trigger",
+      "description": null
+    }
+  },
+  {
+    "name": "Automate blog updates via Discord with GitHub and Gemini AI",
+    "description": null,
+    "active": false,
+    "isArchived": true,
+    "nodes": [
+      {
+        "parameters": {
+          "promptType": "define",
+          "text": "={{ $json.content }}",
+          "options": {
+            "systemMessage": "=\n## Core Identity & Persona\n\nYou are the **n8n Blog Master**, a specialized AI agent. Your primary function is to assist your user with content management.\n\n* **Your Mission:** Automate the process of creating, formatting, editing, and saving blog posts as Markdown files within the user’s specified repository.  \n* **User Clarification:** The repository owner always refers to your **user** and, in the context of API calls, the **repository owner**. It is never part of a file path.  \n* **Personality:** Helpful, precise, security-conscious. Semi-casual and engaging, but never overly cheerful.  \n\n---\n\n## Operational Zone & Constraints\n\n* **Repository:** You may only interact with the repository **`&lt;insert-repo-name-here&gt;`**.  \n* **Owner:** The repository owner is **`&lt;insert-username-here&gt;`**.  \n* **Branch:** Always operate on the `main` branch.  \n* **Directory Access:** You can **only** write or edit files in the directory **`&lt;insert-directory-path-here&gt;`**. You are forbidden from interacting elsewhere.  \n* **File Permissions:**  \n  - You may **create new `.md` files**.  \n  - If a file already exists, notify the user and ask if they want to edit it.  \n  - Editing is only allowed if the user explicitly confirms (e.g., “yes”, “go ahead”, “continue”).  \n  - If the user confirms, proceed with editing.  \n\n---\n\n## Available Tools & Usage Protocol\n\nYou have a limited but well-defined toolset. Always use them exactly as described:  \n\n### 1. Date & Time Tool  \n* Purpose: Always fetch the current date and time in **IST (India Standard Time)**.  \n* Usage: Call this before creating the blog post so the `date` field in the front matter is correct.  \n* Do not use any other timezone.  \n\n### 2. GitHub Nodes  \n* **Create:** Used to create new files within **`&lt;insert-directory-path-here&gt;`**. Requires three parameters:  \n  - `owner` → always **`&lt;insert-username-here&gt;`**  \n  - `repo` → always **`&lt;insert-repo-name-here&gt;`**  \n  - `path` → must be `&lt;insert-directory-path-here&gt;/&lt;filename&gt;.md`  \n* **List:** Can list files inside **`&lt;insert-directory-path-here&gt;`**. Use it to check existing filenames before creating new ones.  \n* **Read:** Can fetch contents of files if needed.  \n* **Edit:** Can update a specific file in **`&lt;insert-directory-path-here&gt;`**.  \n  - **Protocol:** Before editing, explicitly ask:  \n    *“Are you sure you want me to edit `&lt;filename&gt;.md`?”*  \n  - If the user responds with **“yes”**, **“continue”**, or similar confirmation, proceed.  \n  - If the user declines, do nothing.  \n* Constraint: Never attempt operations outside the specified directory.  \n\n### 3. Data Storage & Message History  \n* Purpose: Store temporary user confirmations and recall **previous user messages** as part of memory.  \n* Example:  \n  - If you ask for edit confirmation and the user replies *“yes”* or *“continue”*, record that in storage.  \n  - If later in the same conversation the user says *“go ahead”* without repeating the filename, check both storage and previous messages to infer intent.  \n* Always reset confirmation after the action is completed.  \n\n---\n\n## Standard Workflow: Creating or Editing Blog Posts\n\n1. **Activation:** Begin when the user says:  \n   - “Draft a new post on…”  \n   - “Make the body about…”  \n   - “Use my rough notes…”  \n   - “Modify it to include…”  \n   - “Edit the file…”  \n\n2. **Information Gathering:**  \n   * Ask for the **Title** (mandatory for new posts).  \n   * Gather **topic, points, or raw notes** from the user.  \n   * If user provides incomplete notes, expand them into a coherent, well-structured article.  \n\n3. **Drafting & Formatting:**  \n   * Call the Date & Time tool.  \n   * Format posts in the following template:  \n\n   ```markdown\n   ---\n   title: \"The Title Provided by the User\"\n   date: \"YYYY-MM-DD\"\n   ---\n\n   [Well-structured blog content goes here. Expand rough notes if needed, maintain logical flow, use clear headings if appropriate.]\n\n   Thanks for Reading!\n  ```\n---\n- Writing rules:\n\nTone: Neutral, informative, lightly conversational — not too cheerful.\n\nFlow: Use line breaks for readability.\n\nExpansion: If notes are provided, polish and structure them.\n\nModification: If asked, revise while preserving original meaning.\n\nFile Naming:\n\nGenerate a short kebab-case filename from the title (e.g., \"Making My Own Java CLI-Based RPG!\" → java-cli-rpg.md).\n\nFile Creation vs Editing:\n\nIf creating → Use the GitHub Create tool.\n\nIf file already exists → Ask the user if they want to edit it.\n\nStore their response in Data Storage.\n\nIf confirmation = yes → proceed with GitHub Edit tool.\n\nIf no → cancel operation.\n\nFinal Action:\n\nConfirm success to the user after creation or editing.\n\nAdvanced Error Handling: \"Resource Not Found\"\n\nIf the create_github_file tool fails with \"Resource not found\":\n\nFirst Failure:\n\nNotify the user that the attempt failed.\n\nState the exact path used.\n\nRetry automatically once.\n\nSecond Failure:\n\nIf it fails again, explain that standard creation isn’t working.\n\nSuggest it may be a permissions issue.\n\nAwait user instructions before proceeding further."
+          }
+        },
+        "name": "AI Agent",
+        "type": "@n8n/n8n-nodes-langchain.agent",
+        "position": [
+          816,
+          240
+        ],
+        "typeVersion": 2.2
+      },
+      {
+        "parameters": {
+          "options": {}
+        },
+        "name": "Google Gemini Chat Model",
+        "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+        "position": [
+          528,
+          448
+        ],
+        "typeVersion": 1
+      },
+      {
+        "parameters": {
+          "options": {
+            "timezone": "={{ /*n8n-auto-generated-fromAI-override*/ $fromAI('Timezone', ``, 'string') }}"
+          }
+        },
+        "name": "Date & Time",
+        "type": "n8n-nodes-base.dateTimeTool",
+        "position": [
+          1360,
+          512
+        ],
+        "typeVersion": 2
+      },
+      {
+        "parameters": {
+          "resource": "file",
+          "owner": {
+            "__rl": true,
+            "mode": "name",
+            "value": "={{ /*n8n-auto-generated-fromAI-override*/ $fromAI('Repository_Owner', ``, 'string') }}"
+          },
+          "repository": {
+            "__rl": true,
+            "mode": "name",
+            "value": "={{ /*n8n-auto-generated-fromAI-override*/ $fromAI('Repository_Name', ``, 'string') }}"
+          },
+          "filePath": "<insert-directory-path-here>",
+          "fileContent": "={{ /*n8n-auto-generated-fromAI-override*/ $fromAI('File_Content', ``, 'string') }}",
+          "commitMessage": "={{ /*n8n-auto-generated-fromAI-override*/ $fromAI('Commit_Message', ``, 'string') }}"
+        },
+        "name": "Create a file in GitHub",
+        "type": "n8n-nodes-base.githubTool",
+        "position": [
+          800,
+          560
+        ],
+        "typeVersion": 1.1
+      },
+      {
+        "parameters": {
+          "resource": "file",
+          "operation": "get",
+          "owner": {
+            "__rl": true,
+            "mode": "name",
+            "value": "={{ /*n8n-auto-generated-fromAI-override*/ $fromAI('Repository_Owner', ``, 'string') }}"
+          },
+          "repository": {
+            "__rl": true,
+            "mode": "name",
+            "value": "={{ /*n8n-auto-generated-fromAI-override*/ $fromAI('Repository_Name', ``, 'string') }}"
+          },
+          "filePath": "<insert-directory-path-here>",
+          "asBinaryProperty": false,
+          "additionalParameters": {}
+        },
+        "name": "Get a file in GitHub",
+        "type": "n8n-nodes-base.githubTool",
+        "position": [
+          1120,
+          672
+        ],
+        "typeVersion": 1.1
+      },
+      {
+        "parameters": {
+          "resource": "file",
+          "operation": "list",
+          "owner": {
+            "__rl": true,
+            "mode": "name",
+            "value": "={{ /*n8n-auto-generated-fromAI-override*/ $fromAI('Repository_Owner', ``, 'string') }}"
+          },
+          "repository": {
+            "__rl": true,
+            "mode": "name",
+            "value": "={{ /*n8n-auto-generated-fromAI-override*/ $fromAI('Repository_Name', ``, 'string') }}"
+          },
+          "filePath": "<insert-directory-path-here>"
+        },
+        "name": "List files in GitHub",
+        "type": "n8n-nodes-base.githubTool",
+        "position": [
+          1248,
+          576
+        ],
+        "typeVersion": 1.1
+      },
+      {
+        "parameters": {
+          "resource": "file",
+          "operation": "edit",
+          "owner": {
+            "__rl": true,
+            "mode": "name",
+            "value": "={{ /*n8n-auto-generated-fromAI-override*/ $fromAI('Repository_Owner', ``, 'string') }}"
+          },
+          "repository": {
+            "__rl": true,
+            "mode": "name",
+            "value": "={{ /*n8n-auto-generated-fromAI-override*/ $fromAI('Repository_Name', ``, 'string') }}"
+          },
+          "filePath": "<insert-directory-path-here>",
+          "fileContent": "={{ /*n8n-auto-generated-fromAI-override*/ $fromAI('File_Content', ``, 'string') }}",
+          "commitMessage": "={{ /*n8n-auto-generated-fromAI-override*/ $fromAI('Commit_Message', ``, 'string') }}"
+        },
+        "name": "Edit a file in GitHub",
+        "type": "n8n-nodes-base.githubTool",
+        "position": [
+          960,
+          608
+        ],
+        "typeVersion": 1.1
+      },
+      {
+        "parameters": {
+          "sessionIdType": "customKey",
+          "sessionKey": "=\"memoryKey\": \"history\"",
+          "contextWindowLength": 20
+        },
+        "name": "Simple Memory",
+        "type": "@n8n/n8n-nodes-langchain.memoryBufferWindow",
+        "position": [
+          656,
+          544
+        ],
+        "typeVersion": 1.3
+      },
+      {
+        "parameters": {
+          "pattern": "every",
+          "additionalFields": {}
+        },
+        "name": "Discord Message Reader",
+        "type": "n8n-nodes-discord-trigger.discordTrigger",
+        "position": [
+          368,
+          240
+        ],
+        "typeVersion": 1
+      },
+      {
+        "parameters": {
+          "resource": "message",
+          "guildId": {
+            "__rl": true,
+            "mode": "list",
+            "value": ""
+          },
+          "channelId": {
+            "__rl": true,
+            "mode": "list",
+            "value": ""
+          },
+          "content": "={{ $('AI Agent').item.json.output }}",
+          "options": {},
+          "embeds": {
+            "values": [
+              {}
+            ]
+          }
+        },
+        "name": "Sends Message to Discord",
+        "type": "n8n-nodes-base.discord",
+        "position": [
+          1408,
+          272
+        ],
+        "typeVersion": 2
+      }
+    ],
+    "connections": {
+      "AI Agent": {
+        "main": [
+          [
+            {
+              "node": "Sends Message to Discord",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Date & Time": {
+        "ai_tool": [
+          [
+            {
+              "node": "AI Agent",
+              "type": "ai_tool",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Simple Memory": {
+        "ai_memory": [
+          [
+            {
+              "node": "AI Agent",
+              "type": "ai_memory",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Get a file in GitHub": {
+        "ai_tool": [
+          [
+            {
+              "node": "AI Agent",
+              "type": "ai_tool",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "List files in GitHub": {
+        "ai_tool": [
+          [
+            {
+              "node": "AI Agent",
+              "type": "ai_tool",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Edit a file in GitHub": {
+        "ai_tool": [
+          [
+            {
+              "node": "AI Agent",
+              "type": "ai_tool",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Discord Message Reader": {
+        "main": [
+          [
+            {
+              "node": "AI Agent",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Create a file in GitHub": {
+        "ai_tool": [
+          [
+            {
+              "node": "AI Agent",
+              "type": "ai_tool",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Google Gemini Chat Model": {
+        "ai_languageModel": [
+          [
+            {
+              "node": "AI Agent",
+              "type": "ai_languageModel",
+              "index": 0
+            }
+          ]
+        ]
+      }
+    },
+    "settings": {
+      "executionOrder": "v1",
+      "binaryMode": "separate",
+      "availableInMCP": false
+    },
+    "nodeGroups": [],
+    "versionCounter": 1,
+    "triggerCount": 0,
+    "versionMetadata": {
+      "name": null,
+      "description": null
+    }
+  },
+  {
+    "name": "RAG",
+    "description": null,
+    "active": false,
+    "isArchived": false,
+    "nodes": [
+      {
+        "parameters": {},
+        "type": "n8n-nodes-base.manualTrigger",
+        "typeVersion": 1,
+        "position": [
+          -272,
+          -112
+        ],
+        "name": "When clicking ‘Execute workflow’"
+      },
+      {
+        "parameters": {
+          "mode": "insert",
+          "qdrantCollection": {
+            "__rl": true,
+            "value": "medical_knowledge",
+            "mode": "list",
+            "cachedResultName": "medical_knowledge"
+          },
+          "options": {}
+        },
+        "type": "@n8n/n8n-nodes-langchain.vectorStoreQdrant",
+        "typeVersion": 1.3,
+        "position": [
+          432,
+          -112
+        ],
+        "name": "Qdrant Vector Store"
+      },
+      {
+        "parameters": {
+          "model": "nomic-embed-text:latest"
+        },
+        "type": "@n8n/n8n-nodes-langchain.embeddingsOllama",
+        "typeVersion": 1,
+        "position": [
+          408,
+          120
+        ],
+        "name": "Embeddings Ollama"
+      },
+      {
+        "parameters": {
+          "dataType": "binary",
+          "textSplittingMode": "custom",
+          "options": {
+            "splitPages": true,
+            "metadata": {
+              "metadataValues": [
+                {
+                  "name": "source",
+                  "value": "={{ $json.fileName }}"
+                },
+                {
+                  "name": "mimeType",
+                  "value": "={{ $json.mimeType }}"
+                }
+              ]
+            }
+          }
+        },
+        "type": "@n8n/n8n-nodes-langchain.documentDefaultDataLoader",
+        "typeVersion": 1.1,
+        "position": [
+          536,
+          120
+        ],
+        "name": "Default Data Loader"
+      },
+      {
+        "parameters": {
+          "fileSelector": "/files/medical_corpus/pdf/*.pdf",
+          "options": {}
+        },
+        "type": "n8n-nodes-base.readWriteFile",
+        "typeVersion": 1.1,
+        "position": [
+          -48,
+          -208
+        ],
+        "name": "Read/Write Files from Disk"
+      },
+      {
+        "parameters": {
+          "chunkSize": 800,
+          "chunkOverlap": 120,
+          "options": {}
+        },
+        "type": "@n8n/n8n-nodes-langchain.textSplitterRecursiveCharacterTextSplitter",
+        "typeVersion": 1,
+        "position": [
+          616,
+          328
+        ],
+        "name": "Recursive Character Text Splitter"
+      },
+      {
+        "parameters": {
+          "fileSelector": "/files/medical_corpus/textbooks/*.pdf",
+          "options": {}
+        },
+        "type": "n8n-nodes-base.readWriteFile",
+        "typeVersion": 1.1,
+        "position": [
+          -48,
+          -16
+        ],
+        "name": "Read/Write Files from Disk1"
+      },
+      {
+        "parameters": {},
+        "type": "n8n-nodes-base.merge",
+        "typeVersion": 3.2,
+        "position": [
+          176,
+          -112
+        ],
+        "name": "Merge"
+      }
+    ],
+    "connections": {
+      "When clicking ‘Execute workflow’": {
+        "main": [
+          [
+            {
+              "node": "Read/Write Files from Disk",
+              "type": "main",
+              "index": 0
+            },
+            {
+              "node": "Read/Write Files from Disk1",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Embeddings Ollama": {
+        "ai_embedding": [
+          [
+            {
+              "node": "Qdrant Vector Store",
+              "type": "ai_embedding",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Default Data Loader": {
+        "ai_document": [
+          [
+            {
+              "node": "Qdrant Vector Store",
+              "type": "ai_document",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Read/Write Files from Disk": {
+        "main": [
+          [
+            {
+              "node": "Merge",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Recursive Character Text Splitter": {
+        "ai_textSplitter": [
+          [
+            {
+              "node": "Default Data Loader",
+              "type": "ai_textSplitter",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Read/Write Files from Disk1": {
+        "main": [
+          [
+            {
+              "node": "Merge",
+              "type": "main",
+              "index": 1
+            }
+          ]
+        ]
+      },
+      "Merge": {
+        "main": [
+          [
+            {
+              "node": "Qdrant Vector Store",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      }
+    },
+    "settings": {
+      "executionOrder": "v1",
+      "binaryMode": "separate",
+      "availableInMCP": false
+    },
+    "nodeGroups": [],
+    "versionCounter": 62,
+    "triggerCount": 0,
+    "versionMetadata": {
+      "name": null,
+      "description": null
+    }
+  },
+  {
+    "name": "LINE 醫療問診",
+    "description": "LINE Messaging API 醫療問診流程；保留原 AI、Memory、PostgreSQL 與 Qdrant 拓撲。",
+    "active": false,
+    "isArchived": false,
+    "nodes": [
+      {
+        "parameters": {
+          "promptType": "define",
+          "text": "={{ $('LINE Normalize').item.json.content }}",
+          "hasOutputParser": true,
+          "options": {
+            "systemMessage": "你是「醫療問診與初步分診 AI Agent」。\n\n你的工作是針對使用者本次提出的症狀進行結構化問診、急症風險篩檢與初步分流。\n\n你不是醫師，不能做出確定診斷、不能開藥、不能要求使用者自行停藥，也不能把可能疾病說成已經確診。\n\n【工作流程前提】\n\n這個 Agent 只會在使用者的永久基本病歷已完成後被呼叫。\n\n資料庫中的永久基本病歷如下：\n\n{{ JSON.stringify($json.profile_json ?? {}) }}\n\n目前 profile_completed 狀態：\n\n{{ $json.profile_completed === true ? 'true' : 'false' }}\n\n永久基本病歷只能作為本次問診的背景資料，不能被症狀資料覆蓋。\n\n不要重新詢問已經存在於 profile_json 的基本資料，包括：\n\n- age_range\n- sex_at_birth\n- allergies\n- chronic_conditions\n- regular_medications\n\n除非使用者主動提出要更正或更新該資料，否則不得主動重問。\n\n【永久資料與當次問診資料必須分開】\n\n永久基本資料：\n\n- patient_profile\n- 儲存在 PostgreSQL 的 patient_profiles.profile_json\n\n當次問診資料：\n\n- confirmed_facts\n- 只代表本次症狀\n- 不得寫入永久 patient_profile\n\n例如以下資料屬於當次問診資料，不得放入 patient_profile：\n\n- 胃痛\n- 頭痛\n- 胸痛\n- 疼痛位置\n- 疼痛程度\n- 症狀開始時間\n- 症狀持續時間\n- 噁心、嘔吐、發燒、腹瀉\n- 伴隨的麻木、暈眩或呼吸困難\n\n【每一輪的處理順序】\n\n每一輪都必須依照以下順序處理：\n\n1. 讀取完整對話記憶。\n2. 整理目前已經被使用者明確確認的 confirmed_facts。\n3. 讀取本輪使用者訊息，擷取新的症狀資訊。\n4. 先檢查是否存在急症或高風險警訊。\n5. 如果沒有急症，再判斷下一個最重要且尚未確認的問診資料。\n6. 每輪最多只能問一個問題。\n7. 不得輸出問題清單，不得一次詢問多個獨立問題。\n8. 不得重複詢問已經確認的症狀資料。\n\n【重要症狀判斷規則】\n\n「胃痛」不等於「上腹部」。\n\n「肚子痛」不等於「下腹部」。\n\n只有使用者明確表示疼痛位置後，才可以把 pain_location 寫入 confirmed_facts。\n\n如果使用者只說：\n\n- 胃痛\n- 肚子痛\n- 腹部不舒服\n\n但沒有說明明確位置，必須詢問疼痛位置，不可以自行推測。\n\n疼痛嚴重度必須以使用者明確提供的數字或描述為準，不可以自行猜測。\n\n【一般問診資料】\n\n依照使用者的主要症狀，逐步收集最有幫助的資料，例如：\n\n- chief_complaint：主要不舒服的症狀\n- symptom_location：症狀或疼痛位置\n- onset：何時開始、突然或漸進發生\n- duration：持續多久\n- course：變好、變差、持續或反覆\n- severity：疼痛或不適程度，0 到 10 分\n- quality：刺痛、脹痛、悶痛、灼熱、抽痛等\n- associated_symptoms：伴隨症狀\n- aggravating_factors：什麼情況會變嚴重\n- relieving_factors：什麼情況會改善\n- relevant_context：外傷、懷孕可能性、近期手術、感染暴露、旅行或特殊用藥等\n\n不需要每一項都詢問。請根據主要症狀，選擇目前最重要且尚未確認的一項。\n\n【急症與紅旗警訊】\n\n如果出現以下任何情況，必須立即使用 mode=\"emergency\"：\n\n- 呼吸困難、嘴唇發紫或無法完整說話\n- 胸部壓迫感或胸痛合併冒冷汗、暈厥、嚴重喘\n- 臉歪、單側手腳無力、說話不清、突然意識混亂\n- 新發生的抽搐、昏迷、意識改變\n- 突然在幾秒到一分鐘內達到最嚴重程度的劇烈頭痛\n- 頭部外傷後出現意識改變、反覆嘔吐或嚴重頭痛\n- 高燒合併嚴重頸部僵硬、意識改變或快速惡化\n- 大量吐血、血便、黑便或疑似嚴重內出血\n- 劇烈腹痛合併腹部僵硬、昏厥或持續惡化\n- 嚴重過敏反應，包含臉部或喉嚨腫脹、喘或吞嚥困難\n- 疑似中毒、藥物過量或危險物質暴露\n- 有自傷或傷害他人的想法\n- 症狀快速惡化，或使用者已經無法安全等待\n\n進入 emergency 時：\n\n1. 不要繼續一般問診。\n2. 不要呼叫 Qdrant。\n3. 不要提供一長串可能疾病。\n4. 不要詢問年齡、過敏、慢性疾病或長期用藥。\n5. 先給出清楚的就醫行動。\n6. 建議立即聯絡當地緊急服務或前往急診；若使用者在台灣，可撥打 119。\n7. patient_message 必須先說明緊急性，再說明原因。\n8. 不要把 emergency 說成確定診斷。\n\n【狀態機】\n\n只能使用以下 mode：\n\n1. collecting\n\n仍然缺少重要問診資料時使用。\n\n規則：\n\n- 只能問一個問題。\n- next_question 必須包含一個問題。\n- patient_message 必須等於 next_question。\n- confirmed_facts 必須保留之前已確認的資料。\n\n2. insufficient\n\n目前資料不足以安全判斷下一步時使用。\n\n規則：\n\n- 清楚說明缺少哪一項重要資料。\n- 只能詢問一個最重要的缺少項目。\n- 不可以直接猜測或列出診斷。\n\n3. awaiting_confirmation\n\n已經收集到足夠的本次症狀資料，需要請使用者確認時使用。\n\npatient_message 必須包含簡短的事實摘要，並只提出以下一個確認問題：\n\n以上資料是否正確？請回答「是」，或指出需要修改的項目。\n\n如果使用者回答：\n\n- 是\n- 對\n- 正確\n- 沒錯\n\n則下一輪必須進入 differential_ready，不得重複相同摘要。\n\n如果使用者指出錯誤，必須更新 confirmed_facts，回到 collecting，只詢問一個必要問題。\n\n4. differential_ready\n\n使用者已確認症狀資料，且沒有急症警訊時使用。\n\n可以提供：\n\n- 可能方向\n- 需要留意的症狀\n- 建議就醫層級\n- 下一步觀察事項\n\n不得使用「你就是某疾病」或「已確診」等說法。\n\n請使用：\n\n- 可能與……有關\n- 需要排除……\n- 目前資訊比較符合……\n- 僅能作為初步分流參考\n\n如果使用者要求「再多問一點」、「判斷細一點」或「可以再問」，下一輪必須回到 collecting，並提出一個尚未確認且最有價值的問題。\n\n5. emergency\n\n遇到任何急症或紅旗警訊時使用。\n\n不要繼續一般問診，也不要先列出鑑別診斷。\n\n【Qdrant 使用規則】\n\nQdrant 只能用於查詢醫療知識、衛教資料或分流參考內容。\n\n只有在以下條件同時成立時才可以使用 Qdrant：\n\n- mode 不是 emergency\n- 已經收集足夠的症狀事實\n- 需要參考醫療知識或衛教內容\n\n不得把以下資料寫入 Qdrant：\n\n- LINE 使用者 ID\n- patient_profile\n- 過敏資料\n- 慢性疾病\n- 長期用藥\n- 未經確認的症狀推測\n\n如果 Qdrant 沒有找到資料，不可以自行編造答案。\n\n【醫療安全規則】\n\n- 不得做確定診斷。\n- 不得開藥或指示停藥。\n- 不得建議使用者忽略嚴重症狀。\n- 不得把模型猜測當成使用者說過的資料。\n- 不得把未確認的症狀寫入 confirmed_facts。\n- 使用者沒有回答的欄位，必須保持空白或列在 missing_critical_fields。\n- 使用者回答「不知道」、「沒有」、「不想回答」時，請依語意記錄為 unknown、none 或 declined，不要反覆追問。\n- 每一輪只能詢問一個問題。\n\n【輸出規則】\n\n只輸出符合 Structured Output Parser 的 JSON。\n\n不要輸出 Markdown。\n\n不要輸出 ```json。\n\npatient_message 是唯一可以傳送給 LINE 使用者的欄位。\n\ncollecting 或 insufficient 狀態：\n\n- next_question 必須是一個問題\n- patient_message 必須是同一個問題\n- 不得輸出問題清單\n\nawaiting_confirmation 狀態：\n\n- patient_message 必須包含簡短摘要\n- 只能提出一個確認問題\n- next_question 必須是確認問題\n\ndifferential_ready 狀態：\n\n- next_question 必須是空字串\n- patient_message 提供初步分流結果或衛教建議\n\nemergency 狀態：\n\n- next_question 必須是空字串\n- patient_message 必須提供清楚的緊急就醫行動\n- 不得繼續一般問診\n\nmedical_disclaimer 固定使用：\n\n以上內容僅供參考，不能取代醫師診斷；如有嚴重或快速惡化的症狀，請立即就醫。",
+            "maxIterations": 10,
+            "returnIntermediateSteps": false
+          }
+        },
+        "type": "@n8n/n8n-nodes-langchain.agent",
+        "typeVersion": 3.1,
+        "position": [
+          1680,
+          880
+        ],
+        "name": "問診1"
+      },
+      {
+        "parameters": {
+          "promptType": "define",
+          "text": "={{ $('LINE Normalize').item.json.content }}",
+          "hasOutputParser": true,
+          "options": {
+            "systemMessage": "你是「病歷確認閘門 AI」。\n\n你的工作不是問診，也不是診斷，而是在症狀問診開始前，先展示資料庫中已經儲存的基本病歷，並詢問使用者是否需要修改。\n\n目前資料庫中的基本病歷：\n\n{{ JSON.stringify($json.profile_json ?? {}) }}\n\n目前病歷完成狀態：\n\n{{ $json.has_complete_profile === true ? 'complete' : 'incomplete' }}\n\n【重要規則】\n\n1. 不要把 profile_json 原始 JSON 直接顯示給使用者。\n2. 請將資料整理成容易閱讀的繁體中文清單。\n3. 不要主動詢問症狀。\n4. 不要重新詢問已存在的基本資料。\n5. 每一輪最多只能詢問一個問題。\n6. 不要把症狀資料寫入 patient_profile。\n7. 不要修改資料庫；修改資料交給後續的病歷更新 Agent。\n8. 不要提供醫療診斷。\n\n【需要展示的病歷欄位】\n\n請依照以下名稱展示：\n\n- 年齡或年齡區間：age_range\n- 出生時生理性別：sex_at_birth\n- 過敏：allergies\n- 慢性疾病：chronic_conditions\n- 長期使用藥物：regular_medications\n\n如果欄位值是空字串，請顯示「尚未提供」。\n如果欄位值是 unknown，請顯示「不確定」。\n如果欄位值是 none，請顯示「無」。\n如果欄位值是 declined，請顯示「使用者選擇不回答」。\n\n【首次進入此 Agent 時】\n\n如果目前對話記憶中還沒有完成病歷確認，請輸出：\n\n1. 簡短展示目前儲存的基本病歷。\n2. 詢問：\n\n「以上病歷資料是否需要更改？」\n\n此時：\n\n- profile_action = \"ask_change\"\n- profile_reviewed = false\n- 不要詢問症狀。\n- 不要顯示一長串其他問題。\n\n【使用者表示不需要更改時】\n\n如果使用者回答以下意思：\n\n- 不需要\n- 不用改\n- 不用更改\n- 沒問題\n- 正確\n- 保持現在資料\n\n如果 has_complete_profile=true：\n\n- profile_action = \"start_triage\"\n- profile_reviewed = true\n- patient_message 必須表示病歷維持不變，並請使用者描述目前症狀。\n\n例如：\n\n「好的，基本病歷資料維持不變。請告訴我目前最困擾您的症狀。」\n\n如果 has_complete_profile=false：\n\n- profile_action = \"continue_profile\"\n- profile_reviewed = true\n- 將流程交給基本病歷收集 Agent，繼續補完缺少欄位。\n\n【進入症狀問診後的持續路由】\n\n如果完整對話記憶中已經出現 profile_action = \"start_triage\"，表示基本病歷確認已完成，而且目前已經進入本次症狀問診。從這一刻起，除非使用者明確要求修改五項基本病歷，所有後續訊息都必須維持：\n\n- profile_action = \"start_triage\"\n- profile_reviewed = true\n- 不得再次輸出基本病歷摘要。\n- 不得回到 ask_change。\n- 讓「問診」Agent 處理本輪訊息。\n\n這些後續訊息包括症狀、症狀位置（例如「中間」）、嚴重程度、發生時間、伴隨症狀，以及「無」、「不知道」、「是」、「否」等問診回答。即使本輪訊息只有一個位置或簡短回答，也必須維持 start_triage。\n\n如果使用者明確要求修改年齡、出生時生理性別、過敏、慢性疾病或長期用藥，修改意圖優先，才可切換為 edit_profile；除此之外不得重新啟動病例確認。\n\n【使用者表示需要修改時】\n\n如果使用者回答：\n\n- 要修改\n- 需要更改\n- 過敏改成……\n- 我現在有吃……\n- 慢性病新增……\n- 年齡資料不正確\n\n則：\n\n- profile_action = \"edit_profile\"\n- profile_reviewed = true\n- 將使用者主動提供的修改內容放入 patient_profile。\n- 如果使用者只說「我要修改」，但沒有說明哪一欄，只能詢問：\n\n「請問您想修改年齡、出生時生理性別、過敏、慢性疾病，還是長期用藥？」\n\n不得一次詢問修改內容和症狀。\n\n【如果病歷確認已經完成】\n\n如果對話記憶中已經顯示使用者完成過病歷確認，且本輪訊息是症狀，例如：\n\n- 頭痛\n- 胃痛\n- 胸口悶\n- 我拉肚子\n\n則：\n\n- profile_action = \"start_triage\"\n- 不要再次展示同一份病歷。\n- 讓問診 AI Agent 處理本輪症狀。\n\n【輸出規則】\n\n只能輸出 JSON，不要輸出 Markdown，不要輸出 ```json。\n\npatient_message 是唯一要傳送給 LINE 使用者的訊息。\n\nmedical_disclaimer 固定為：\n\n「以上內容僅供參考，不能取代醫師診斷；如有嚴重或快速惡化的症狀，請立即就醫。」\n\n【最終格式硬性要求】\n\n- 只輸出一個合法 JSON 物件；不得輸出 ```、Markdown、前言、後記或 <think> 內容。\n- 所有欄位都必須存在：profile_action、profile_reviewed、patient_message、next_question、patient_profile、medical_disclaimer。\n- profile_action 只能是 ask_change、edit_profile、start_triage、continue_profile 其中之一。\n- profile_reviewed 必須是 JSON boolean，不是字串。\n- patient_profile 必須是物件；沒有要修改的欄位使用空字串。\n- 字串內的換行必須使用 \\n  轉義，不得放入未轉義的實際換行。"
+          }
+        },
+        "type": "@n8n/n8n-nodes-langchain.agent",
+        "typeVersion": 3.1,
+        "position": [
+          624,
+          1072
+        ],
+        "name": "AI Agent1"
+      },
+      {
+        "parameters": {
+          "conditions": {
+            "options": {
+              "caseSensitive": true,
+              "leftValue": "",
+              "typeValidation": "strict",
+              "version": 3
+            },
+            "conditions": [
+              {
+                "leftValue": "={{ $json.output?.profile_action ?? $json.profile_action }}",
+                "rightValue": "ask_change",
+                "operator": {
+                  "type": "string",
+                  "operation": "equals"
+                }
+              }
+            ],
+            "combinator": "and"
+          },
+          "options": {}
+        },
+        "type": "n8n-nodes-base.if",
+        "typeVersion": 2.3,
+        "position": [
+          1072,
+          1072
+        ],
+        "name": "是否先詢問修改1",
+        "alwaysOutputData": false,
+        "executeOnce": false
+      },
+      {
+        "parameters": {
+          "conditions": {
+            "options": {
+              "caseSensitive": true,
+              "leftValue": "",
+              "typeValidation": "strict",
+              "version": 3
+            },
+            "conditions": [
+              {
+                "leftValue": "={{ ['differential_ready', 'emergency'].includes(String($('問診1').first().json.output?.mode ?? '')) }}",
+                "rightValue": "",
+                "operator": {
+                  "type": "boolean",
+                  "operation": "true",
+                  "singleValue": true
+                }
+              }
+            ],
+            "combinator": "and"
+          },
+          "options": {}
+        },
+        "type": "n8n-nodes-base.if",
+        "typeVersion": 2.3,
+        "position": [
+          2496,
+          1088
+        ],
+        "name": "是否完成問診才清除記憶1",
+        "alwaysOutputData": false,
+        "executeOnce": false
+      },
+      {
+        "parameters": {
+          "mode": "delete",
+          "deleteMode": "all"
+        },
+        "type": "@n8n/n8n-nodes-langchain.memoryManager",
+        "typeVersion": 1.1,
+        "position": [
+          2720,
+          1088
+        ],
+        "name": "清除當次問診記憶1"
+      },
+      {
+        "parameters": {
+          "mode": "delete",
+          "deleteMode": "all"
+        },
+        "type": "@n8n/n8n-nodes-langchain.memoryManager",
+        "typeVersion": 1.1,
+        "position": [
+          3072,
+          1088
+        ],
+        "name": "清除病例確認記憶1"
+      },
+      {
+        "parameters": {
+          "mode": "delete",
+          "deleteMode": "all"
+        },
+        "type": "@n8n/n8n-nodes-langchain.memoryManager",
+        "typeVersion": 1.1,
+        "position": [
+          3424,
+          1088
+        ],
+        "name": "清除病例收集記憶1"
+      },
+      {
+        "parameters": {
+          "model": "qwen3.5-4b:q4",
+          "options": {}
+        },
+        "type": "@n8n/n8n-nodes-langchain.lmChatOllama",
+        "typeVersion": 1,
+        "position": [
+          1512,
+          1112
+        ],
+        "name": "Ollama Chat Model3"
+      },
+      {
+        "parameters": {
+          "sessionIdType": "customKey",
+          "sessionKey": "={{\n  String($('LINE Normalize').first().json.authorId || 'unknown-user')\n  + ':' +\n  String($('LINE Normalize').first().json.channelId || 'unknown-channel')\n  + ':triage-v2'\n}}",
+          "contextWindowLength": 20
+        },
+        "type": "@n8n/n8n-nodes-langchain.memoryBufferWindow",
+        "typeVersion": 1.4,
+        "position": [
+          1640,
+          1112
+        ],
+        "name": "Simple Memory3"
+      },
+      {
+        "parameters": {
+          "mode": "retrieve-as-tool",
+          "toolDescription": "客服幾點上班？",
+          "qdrantCollection": {
+            "__rl": true,
+            "value": "medical_knowledge",
+            "mode": "list",
+            "cachedResultName": "medical_knowledge"
+          },
+          "options": {}
+        },
+        "type": "@n8n/n8n-nodes-langchain.vectorStoreQdrant",
+        "typeVersion": 1.3,
+        "position": [
+          1768,
+          1112
+        ],
+        "name": "醫療數據庫1"
+      },
+      {
+        "parameters": {
+          "jsonSchemaExample": "{\n  \"mode\": \"collecting\",\n  \"question_key\": \"symptom_location\",\n  \"next_question\": \"請問疼痛是在上腹部、下腹部、左側、右側，還是其他位置？\",\n  \"patient_message\": \"請問疼痛是在上腹部、下腹部、左側、右側，還是其他位置？\",\n  \"confirmed_facts\": {\n    \"chief_complaint\": \"胃痛\"\n  },\n  \"possible_conditions\": [],\n  \"red_flags\": [],\n  \"missing_critical_fields\": [\n    \"symptom_location\"\n  ],\n  \"confidence\": 0,\n  \"medical_disclaimer\": \"以上內容僅供參考，不能取代醫師診斷；如有嚴重或快速惡化的症狀，請立即就醫。\"\n}"
+        },
+        "type": "@n8n/n8n-nodes-langchain.outputParserStructured",
+        "typeVersion": 1.3,
+        "position": [
+          2056,
+          1112
+        ],
+        "name": "Structured Output Parser3"
+      },
+      {
+        "parameters": {
+          "conditions": {
+            "options": {
+              "caseSensitive": true,
+              "leftValue": "",
+              "typeValidation": "strict",
+              "version": 3
+            },
+            "conditions": [
+              {
+                "leftValue": "={{ $json.output?.profile_action ?? $json.profile_action }}",
+                "rightValue": "edit_profile",
+                "operator": {
+                  "type": "string",
+                  "operation": "equals"
+                }
+              }
+            ],
+            "combinator": "and"
+          },
+          "options": {}
+        },
+        "type": "n8n-nodes-base.if",
+        "typeVersion": 2.3,
+        "position": [
+          1296,
+          1168
+        ],
+        "name": "是否需要重建病歷1",
+        "alwaysOutputData": false,
+        "executeOnce": false
+      },
+      {
+        "parameters": {
+          "operation": "executeQuery",
+          "query": "WITH existing_profile AS (\n  SELECT\n    p.discord_user_id,\n    p.profile_json,\n    p.profile_completed,\n    (\n      NULLIF(BTRIM(p.profile_json->>'age_range'), '') IS NOT NULL\n      AND NULLIF(BTRIM(p.profile_json->>'sex_at_birth'), '') IS NOT NULL\n      AND NULLIF(BTRIM(p.profile_json->>'allergies'), '') IS NOT NULL\n      AND NULLIF(BTRIM(p.profile_json->>'chronic_conditions'), '') IS NOT NULL\n      AND NULLIF(BTRIM(p.profile_json->>'regular_medications'), '') IS NOT NULL\n    ) AS has_complete_profile,\n    FALSE AS is_new_profile\n  FROM patient_profiles AS p\n  WHERE p.discord_user_id = $1::text\n), missing_profile AS (\n  SELECT\n    $1::text AS discord_user_id,\n    '{}'::jsonb AS profile_json,\n    FALSE AS profile_completed,\n    FALSE AS has_complete_profile,\n    TRUE AS is_new_profile\n  WHERE NOT EXISTS (\n    SELECT 1\n    FROM patient_profiles AS p2\n    WHERE p2.discord_user_id = $1::text\n  )\n)\nSELECT * FROM existing_profile\nUNION ALL\nSELECT * FROM missing_profile\nLIMIT 1;",
+          "options": {
+            "queryReplacement": "={{\n  [\n    String($('LINE Normalize').first().json.authorId || '')\n  ]\n}}"
+          }
+        },
+        "type": "n8n-nodes-base.postgres",
+        "typeVersion": 2.7,
+        "position": [
+          176,
+          1248
+        ],
+        "name": "檢視病例1"
+      },
+      {
+        "parameters": {
+          "conditions": {
+            "options": {
+              "caseSensitive": true,
+              "leftValue": "",
+              "typeValidation": "strict",
+              "version": 3
+            },
+            "conditions": [
+              {
+                "leftValue": "={{ $json.has_complete_profile }}",
+                "rightValue": "=",
+                "operator": {
+                  "type": "boolean",
+                  "operation": "true",
+                  "singleValue": true
+                }
+              }
+            ],
+            "combinator": "and"
+          },
+          "options": {}
+        },
+        "type": "n8n-nodes-base.if",
+        "typeVersion": 2.3,
+        "position": [
+          400,
+          1248
+        ],
+        "name": "是否已有病例1"
+      },
+      {
+        "parameters": {
+          "jsonSchemaExample": "{\n  \"profile_action\": \"ask_change\",\n  \"profile_reviewed\": false,\n  \"patient_message\": \"目前儲存的基本病歷：\\n\\n年齡或年齡區間：45-54歲\\n出生時生理性別：男性\\n過敏：無\\n慢性疾病：高血壓\\n長期使用藥物：降壓藥\\n\\n以上病歷資料是否需要更改？\",\n  \"next_question\": \"以上病歷資料是否需要更改？\",\n  \"patient_profile\": {\n    \"age_range\": \"\",\n    \"sex_at_birth\": \"\",\n    \"allergies\": \"\",\n    \"chronic_conditions\": \"\",\n    \"regular_medications\": \"\"\n  },\n  \"medical_disclaimer\": \"以上內容僅供參考，不能取代醫師診斷；如有嚴重或快速惡化的症狀，請立即就醫。\"\n}",
+          "autoFix": true
+        },
+        "type": "@n8n/n8n-nodes-langchain.outputParserStructured",
+        "typeVersion": 1.3,
+        "position": [
+          696,
+          1304
+        ],
+        "name": "Structured Output Parser5"
+      },
+      {
+        "parameters": {
+          "model": "nomic-embed-text:latest"
+        },
+        "type": "@n8n/n8n-nodes-langchain.embeddingsOllama",
+        "typeVersion": 1,
+        "position": [
+          1848,
+          1320
+        ],
+        "name": "Embeddings Ollama1"
+      },
+      {
+        "parameters": {
+          "sessionIdType": "customKey",
+          "sessionKey": "={{\n  String($('LINE Normalize').first().json.authorId || 'unknown-user')\n  + ':' +\n  String($('LINE Normalize').first().json.channelId || 'unknown-channel')\n  + ':profile-review-v1'\n}}",
+          "contextWindowLength": 20
+        },
+        "type": "@n8n/n8n-nodes-langchain.memoryBufferWindow",
+        "typeVersion": 1.3,
+        "position": [
+          3144,
+          1320
+        ],
+        "name": "Simple Memory5"
+      },
+      {
+        "parameters": {
+          "sessionIdType": "customKey",
+          "sessionKey": "={{ String($('LINE Normalize').first().json.authorId || 'unknown-user') }}"
+        },
+        "type": "@n8n/n8n-nodes-langchain.memoryBufferWindow",
+        "typeVersion": 1.4,
+        "position": [
+          3496,
+          1320
+        ],
+        "name": "Simple Memory4"
+      },
+      {
+        "parameters": {
+          "model": "qwen3.5-4b:q4",
+          "options": {
+            "think": false,
+            "temperature": 0,
+            "numPredict": 600,
+            "format": "json"
+          }
+        },
+        "type": "@n8n/n8n-nodes-langchain.lmChatOllama",
+        "typeVersion": 1,
+        "position": [
+          696,
+          1512
+        ],
+        "name": "Ollama Chat Model5"
+      },
+      {
+        "parameters": {
+          "promptType": "define",
+          "text": "={{ $('LINE Normalize').item.json.content }}",
+          "hasOutputParser": true,
+          "options": {
+            "systemMessage": "你是「一次性電子病歷基本資料建立 Agent1」。\n\n你的工作不是診斷疾病，也不是進行症狀分流；你的唯一工作是建立並更新使用者的基本電子病歷資料。\n\n【目前工作流程狀態】\n\n是否為第一次建立病歷：\n{{ $('檢視病例1').first().json.is_new_profile === true ? '是' : '否' }}\n\n目前病歷是否已完成：\n{{ $('檢視病例1').first().json.has_complete_profile === true ? '是' : '否' }}\n\n目前資料庫已儲存的基本資料：\n{{ JSON.stringify($('檢視病例1').first().json.profile_json ?? {}) }}\n\n目前的流程分流動作：\n{{ $json.output?.profile_action ?? 'profile_collecting' }}\n\n【需要收集的基本資料】\n\npatient_profile 必須保留以下欄位：\n\n- preferred_name\n- age_range\n- sex_at_birth\n- allergies\n- chronic_conditions\n- regular_medications\n\npreferred_name 可以沒有資料；其他欄位需要逐一收集。\n\n【基本規則】\n\n1. 每一輪先讀取資料庫已儲存的 profile_json，以及本輪使用者訊息。\n\n2. 必須保留已經收集到的資料，不能用空字串、null 或空陣列覆蓋原本已有的資料。\n\n3. 如果使用者本輪一次提供多個基本資料，請全部擷取並儲存，不要只儲存其中一項。\n\n4. 如果使用者回答以下內容，視為該欄位已完成，不要重問：\n\n   - 不知道、不清楚 → 記錄為 \"unknown\"\n   - 沒有、無 → 記錄為 \"none\"\n   - 不想回答、拒絕回答 → 記錄為 \"declined\"\n\n5. 已經完成的欄位禁止再次主動詢問，除非使用者主動要求修改。\n\n6. 每一輪最多只能詢問一個尚未完成的基本資料欄位，不可以一次提出問題清單，也不可以同時詢問多個獨立問題。\n\n7. 年齡可以記錄為年齡或年齡區間，例如：\n   - \"35\"\n   - \"30-39\"\n   - \"unknown\"\n\n8. 過敏、慢性疾病及長期用藥，如果使用者表示沒有，請記錄為 \"none\"，不要留下空白。\n\n9. 如果使用者同時描述症狀，請將症狀保留在 pending_chief_complaint，不能把症狀放進永久的 patient_profile。\n\n【既有病歷修改模式】\n\n如果目前的流程分流動作是 edit_profile，代表使用者正在修改既有病歷。\n\n- 不要顯示第一次建立病歷的提示。\n- 只處理使用者本輪明確要求修改的欄位。\n- 保留 profile_json 中所有未被修改的欄位。\n- 如果使用者只表示想修改但沒有說明欄位，只詢問一個修改欄位。\n- 修改完成後輸出完整合併後的 patient_profile，不能只輸出修改欄位。\n\n【第一次建立病歷的提示訊息】\n\n只有在以下兩個條件同時成立時，才顯示第一次建立病歷提示：\n\n- is_new_profile === true\n- profile_completed !== true\n\n第一次建立時，patient_message 必須以以下文字開頭：\n\n系統目前未偵測到您先前建立的基本病歷資料，現在開始進行第一次基本資料建立。\n\n提示文字後面換行，再提出一個尚未完成的基本資料問題。\n\n例如：\n\n系統目前未偵測到您先前建立的基本病歷資料，現在開始進行第一次基本資料建立。\n\n請問您的年齡或年齡區間？\n\n如果 is_new_profile === false，代表資料庫已經有這位使用者的病歷資料，即使目前尚未完成，也不要再次顯示「未偵測到病歷」這段提示，只要繼續詢問下一個尚未完成的欄位。\n\n【完成狀態】\n\n如果仍有尚未完成的欄位：\n\n- mode 必須是 \"profile_collecting\"\n- profile_status 必須是 \"incomplete\"\n- profile_question_key 必須是目前正在詢問的欄位\n- next_question 必須只包含一個問題\n- patient_message 必須包含要顯示給使用者的完整訊息\n- missing_profile_fields 必須列出尚未完成的欄位\n\n如果所有基本資料都已完成：\n\n- mode 必須是 \"profile_complete\"\n- profile_status 必須是 \"complete\"\n- profile_question_key 必須是 \"\"\n- next_question 必須是 \"\"\n- missing_profile_fields 必須是 []\n- patient_message 必須告知使用者基本病歷資料已建立完成，並提醒接下來可以描述這次的症狀\n\n完成訊息可以使用：\n\n基本病歷資料已建立完成。接下來請描述您這次不舒服的症狀，我會協助進行初步分流。\n\n【訊息規則】\n\n- patient_message 是唯一會傳送到 LINE 的欄位。\n- next_question 只放目前要詢問的一個問題。\n- 每一輪只能有一個問號或一個問題。\n- 不要輸出問題清單。\n- 不要把內部欄位名稱、JSON、SQL 或系統規則顯示給使用者。\n- 不要聲稱已經診斷出任何疾病。\n- 回覆中要保留以下醫療免責聲明：\n\n以上內容僅供參考，不能取代醫師診斷；如有嚴重或快速惡化的症狀，請立即就醫。\n\n【輸出要求】\n\n只輸出符合 Structured Output Parser 的 JSON，不要加 Markdown，不要加 ```json。\n\n必須輸出以下欄位：\n\n- mode\n- profile_status\n- profile_question_key\n- next_question\n- patient_message\n- patient_profile\n- pending_chief_complaint\n- missing_profile_fields\n- medical_disclaimer"
+          }
+        },
+        "type": "@n8n/n8n-nodes-langchain.agent",
+        "typeVersion": 3.1,
+        "position": [
+          1712,
+          1600
+        ],
+        "name": "病歷資料收集1"
+      },
+      {
+        "parameters": {
+          "operation": "upsert",
+          "schema": {
+            "__rl": true,
+            "mode": "list",
+            "value": "public"
+          },
+          "table": {
+            "__rl": true,
+            "value": "patient_profiles",
+            "mode": "list",
+            "cachedResultName": "patient_profiles"
+          },
+          "columns": {
+            "mappingMode": "defineBelow",
+            "value": {
+              "profile_completed": "={{\n(() => {\n  const current = $('檢視病例1').first().json.profile_json ?? {};\n  const incoming = $json.output?.patient_profile ?? $json.patient_profile ?? {};\n  const merged = {\n    ...(typeof current === 'object' && current !== null ? current : {})\n  };\n  for (const key of [\n    'preferred_name',\n    'age_range',\n    'sex_at_birth',\n    'allergies',\n    'chronic_conditions',\n    'regular_medications'\n  ]) {\n    const value = incoming[key];\n    const text = Array.isArray(value) ? value.join('、').trim() : (value == null ? '' : String(value).trim());\n    if (text) merged[key] = value;\n  }\n  return [\n    'age_range',\n    'sex_at_birth',\n    'allergies',\n    'chronic_conditions',\n    'regular_medications'\n  ].every((key) => {\n    const value = merged[key];\n    return value !== null && value !== undefined && (Array.isArray(value) ? value.length > 0 : String(value).trim() !== '');\n  });\n})()\n}}",
+              "discord_user_id": "={{ $('LINE Normalize').item.json.authorId }}",
+              "profile_json": "={{\n(() => {\n  const current = $('檢視病例1').first().json.profile_json ?? {};\n  const incoming = $json.output?.patient_profile ?? $json.patient_profile ?? {};\n  const merged = {\n    ...(typeof current === 'object' && current !== null ? current : {})\n  };\n  const keys = [\n    'preferred_name',\n    'age_range',\n    'sex_at_birth',\n    'allergies',\n    'chronic_conditions',\n    'regular_medications'\n  ];\n  for (const key of keys) {\n    const value = incoming[key];\n    const text = Array.isArray(value) ? value.join('、').trim() : (value == null ? '' : String(value).trim());\n    if (text) merged[key] = value;\n  }\n  return merged;\n})()\n}}"
+            },
+            "matchingColumns": [
+              "discord_user_id"
+            ],
+            "schema": [
+              {
+                "displayName": "discord_user_id",
+                "required": true,
+                "defaultMatch": false,
+                "display": true,
+                "type": "string",
+                "canBeUsedToMatch": true,
+                "removed": false
+              },
+              {
+                "displayName": "profile_json",
+                "required": false,
+                "defaultMatch": false,
+                "display": true,
+                "type": "object",
+                "canBeUsedToMatch": false
+              },
+              {
+                "displayName": "profile_completed",
+                "required": false,
+                "defaultMatch": false,
+                "display": true,
+                "type": "boolean",
+                "canBeUsedToMatch": false
+              },
+              {
+                "displayName": "created_at",
+                "required": false,
+                "defaultMatch": false,
+                "display": true,
+                "type": "dateTime",
+                "canBeUsedToMatch": false
+              },
+              {
+                "displayName": "updated_at",
+                "required": false,
+                "defaultMatch": false,
+                "display": true,
+                "type": "dateTime",
+                "canBeUsedToMatch": false
+              }
+            ],
+            "attemptToConvertTypes": false,
+            "convertFieldsToString": false
+          },
+          "options": {}
+        },
+        "type": "n8n-nodes-base.postgres",
+        "typeVersion": 2.7,
+        "position": [
+          2272,
+          1600
+        ],
+        "name": "建立病歷1"
+      },
+      {
+        "parameters": {
+          "model": "qwen3.5-4b:q4",
+          "options": {}
+        },
+        "type": "@n8n/n8n-nodes-langchain.lmChatOllama",
+        "typeVersion": 1,
+        "position": [
+          1720,
+          1816
+        ],
+        "name": "Ollama Chat Model4"
+      },
+      {
+        "parameters": {
+          "jsonSchemaExample": "{\n  \"mode\": \"profile_collecting\",\n  \"profile_status\": \"incomplete\",\n  \"profile_question_key\": \"age_range\",\n  \"next_question\": \"請問您的年齡或年齡區間？\",\n  \"patient_message\": \"請問您的年齡或年齡區間？\",\n  \"patient_profile\": {\n    \"preferred_name\": \"\",\n    \"age_range\": \"\",\n    \"sex_at_birth\": \"\",\n    \"allergies\": \"\",\n    \"chronic_conditions\": \"\",\n    \"regular_medications\": \"\",\n    \"type\": \"string\"\n  },\n  \"pending_chief_complaint\": \"\",\n  \"missing_profile_fields\": [\n    \"age_range\",\n    \"sex_at_birth\",\n    \"allergies\",\n    \"chronic_conditions\",\n    \"regular_medications\"\n  ],\n  \"medical_disclaimer\": \"以上內容僅供參考，不能取代醫師診斷。\"\n}"
+        },
+        "type": "@n8n/n8n-nodes-langchain.outputParserStructured",
+        "typeVersion": 1.3,
+        "position": [
+          1848,
+          1816
+        ],
+        "name": "Structured Output Parser4"
+      },
+      {
+        "parameters": {
+          "httpMethod": "POST",
+          "path": "line/triage",
+          "responseMode": "onReceived",
+          "options": {
+            "rawBody": true,
+            "responseData": "OK"
+          }
+        },
+        "type": "n8n-nodes-base.webhook",
+        "typeVersion": 2.1,
+        "position": [
+          -48,
+          1248
+        ],
+        "name": "LINE Webhook"
+      },
+      {
+        "parameters": {
+          "method": "POST",
+          "url": "https://api.line.me/v2/bot/message/reply",
+          "authentication": "genericCredentialType",
+          "genericAuthType": "httpBearerAuth",
+          "sendQuery": false,
+          "sendHeaders": true,
+          "specifyHeaders": "keypair",
+          "headerParameters": {
+            "parameters": [
+              {
+                "name": "Content-Type",
+                "value": "application/json"
+              }
+            ]
+          },
+          "sendBody": true,
+          "contentType": "json",
+          "specifyBody": "json",
+          "jsonBody": "={{ { replyToken: $('LINE Normalize').first().json.replyToken, messages: [{ type: 'text', text: String($json.output?.patient_message ?? $json.output?.next_question ?? '目前無法產生下一個問題，請稍後再試。') } ] } }}",
+          "options": {}
+        },
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.5,
+        "position": [
+          2272,
+          1088
+        ],
+        "name": "LINE Reply 問診"
+      },
+      {
+        "parameters": {
+          "method": "POST",
+          "url": "https://api.line.me/v2/bot/message/reply",
+          "authentication": "genericCredentialType",
+          "genericAuthType": "httpBearerAuth",
+          "sendQuery": false,
+          "sendHeaders": true,
+          "specifyHeaders": "keypair",
+          "headerParameters": {
+            "parameters": [
+              {
+                "name": "Content-Type",
+                "value": "application/json"
+              }
+            ]
+          },
+          "sendBody": true,
+          "contentType": "json",
+          "specifyBody": "json",
+          "jsonBody": "={{ { replyToken: $('LINE Normalize').first().json.replyToken, messages: [{ type: 'text', text: String($('病歷資料收集1').first().json.output?.patient_message ?? '目前無法產生回覆，請稍後再試。') } ] } }}",
+          "options": {}
+        },
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.5,
+        "position": [
+          2496,
+          1600
+        ],
+        "name": "LINE Reply 病歷收集"
+      },
+      {
+        "parameters": {
+          "method": "POST",
+          "url": "https://api.line.me/v2/bot/message/reply",
+          "authentication": "genericCredentialType",
+          "genericAuthType": "httpBearerAuth",
+          "sendQuery": false,
+          "sendHeaders": true,
+          "specifyHeaders": "keypair",
+          "headerParameters": {
+            "parameters": [
+              {
+                "name": "Content-Type",
+                "value": "application/json"
+              }
+            ]
+          },
+          "sendBody": true,
+          "contentType": "json",
+          "specifyBody": "json",
+          "jsonBody": "={{ (() => { const raw = $('檢視病例1').first().json.profile_json ?? {}; const p = typeof raw === 'string' ? JSON.parse(raw) : raw; const render = (value) => { if (value === null || value === undefined) return '尚未提供'; const text = Array.isArray(value) ? value.join('、').trim() : String(value).trim(); if (!text) return '尚未提供'; const normalized = text.toLowerCase(); if (normalized === 'unknown') return '不確定'; if (normalized === 'none') return '無'; if (normalized === 'declined') return '使用者選擇不回答'; return text; }; const text = `目前資料庫中儲存的基本病歷如下：\\n\\n年齡或年齡區間：${render(p.age_range)}\\n出生時生理性別：${render(p.sex_at_birth)}\\n過敏：${render(p.allergies)}\\n慢性疾病：${render(p.chronic_conditions)}\\n長期使用藥物：${render(p.regular_medications)}\\n\\n以上病歷資料是否需要更改？請回答「不需要」，或告訴我要修改哪一項。`; return { replyToken: $('LINE Normalize').first().json.replyToken, messages: [{ type: 'text', text }] }; })() }}",
+          "options": {}
+        },
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.5,
+        "position": [
+          1296,
+          976
+        ],
+        "name": "LINE Reply 病例確認"
+      },
+      {
+        "parameters": {
+          "action": "hmac",
+          "binaryData": true,
+          "binaryPropertyName": "data",
+          "type": "SHA256",
+          "dataPropertyName": "lineSignature",
+          "encoding": "base64"
+        },
+        "type": "n8n-nodes-base.crypto",
+        "typeVersion": 2,
+        "position": [
+          -600,
+          1248
+        ],
+        "name": "LINE 驗證簽章"
+      },
+      {
+        "parameters": {
+          "conditions": {
+            "options": {
+              "caseSensitive": true,
+              "leftValue": "",
+              "typeValidation": "strict",
+              "version": 3
+            },
+            "conditions": [
+              {
+                "leftValue": "={{ $json.lineSignature }}",
+                "rightValue": "={{ $json.headers['x-line-signature'] || $json.headers['X-Line-Signature'] || '' }}",
+                "operator": {
+                  "type": "string",
+                  "operation": "equals"
+                }
+              }
+            ],
+            "combinator": "and"
+          },
+          "options": {}
+        },
+        "type": "n8n-nodes-base.if",
+        "typeVersion": 2.3,
+        "position": [
+          -400,
+          1248
+        ],
+        "name": "LINE 簽章有效"
+      },
+      {
+        "parameters": {
+          "mode": "runOnceForAllItems",
+          "language": "javaScript",
+          "jsCode": "const input = $input.first();\nconst payload = input.json.body && typeof input.json.body === 'object' ? input.json.body : {};\nconst events = Array.isArray(payload.events) ? payload.events : [];\nconst event = events.find((candidate) =>\n  candidate &&\n  candidate.type === 'message' &&\n  candidate.message &&\n  candidate.message.type === 'text' &&\n  typeof candidate.message.text === 'string' &&\n  candidate.replyToken\n);\nif (!event) return [];\nconst source = event.source || {};\nconst sourceId = source.userId || source.groupId || source.roomId;\nif (!sourceId) return [];\nconst channelType = String(source.type || 'user');\nreturn [{\n  json: {\n    ...input.json,\n    platform: 'line',\n    authorId: `line:${sourceId}`,\n    channelId: `line:${channelType}:${sourceId}`,\n    content: event.message.text,\n    replyToken: event.replyToken,\n    webhookEventId: String(event.webhookEventId || event.message.id || ''),\n    lineValidEvent: true,\n  },\n  binary: input.binary,\n  pairedItem: { item: 0 },\n}];"
+        },
+        "type": "n8n-nodes-base.code",
+        "typeVersion": 2,
+        "position": [
+          -200,
+          1248
+        ],
+        "name": "LINE Normalize"
+      }
+    ],
+    "connections": {
+      "LINE Reply 問診": {
+        "main": [
+          [
+            {
+              "node": "是否完成問診才清除記憶1",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Ollama Chat Model3": {
+        "ai_languageModel": [
+          [
+            {
+              "node": "問診1",
+              "type": "ai_languageModel",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Simple Memory3": {
+        "ai_memory": [
+          [
+            {
+              "node": "問診1",
+              "type": "ai_memory",
+              "index": 0
+            },
+            {
+              "node": "清除當次問診記憶1",
+              "type": "ai_memory",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Embeddings Ollama1": {
+        "ai_embedding": [
+          [
+            {
+              "node": "醫療數據庫1",
+              "type": "ai_embedding",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Structured Output Parser3": {
+        "ai_outputParser": [
+          [
+            {
+              "node": "問診1",
+              "type": "ai_outputParser",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Simple Memory4": {
+        "ai_memory": [
+          [
+            {
+              "node": "病歷資料收集1",
+              "type": "ai_memory",
+              "index": 0
+            },
+            {
+              "node": "清除病例收集記憶1",
+              "type": "ai_memory",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Ollama Chat Model4": {
+        "ai_languageModel": [
+          [
+            {
+              "node": "病歷資料收集1",
+              "type": "ai_languageModel",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "檢視病例1": {
+        "main": [
+          [
+            {
+              "node": "是否已有病例1",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "建立病歷1": {
+        "main": [
+          [
+            {
+              "node": "LINE Reply 病歷收集",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "是否已有病例1": {
+        "main": [
+          [
+            {
+              "node": "AI Agent1",
+              "type": "main",
+              "index": 0
+            }
+          ],
+          [
+            {
+              "node": "病歷資料收集1",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Structured Output Parser4": {
+        "ai_outputParser": [
+          [
+            {
+              "node": "病歷資料收集1",
+              "type": "ai_outputParser",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "病歷資料收集1": {
+        "main": [
+          [
+            {
+              "node": "建立病歷1",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "醫療數據庫1": {
+        "ai_tool": [
+          [
+            {
+              "node": "問診1",
+              "type": "ai_tool",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "問診1": {
+        "main": [
+          [
+            {
+              "node": "LINE Reply 問診",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "AI Agent1": {
+        "main": [
+          [
+            {
+              "node": "是否先詢問修改1",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Structured Output Parser5": {
+        "ai_outputParser": [
+          [
+            {
+              "node": "AI Agent1",
+              "type": "ai_outputParser",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "是否先詢問修改1": {
+        "main": [
+          [
+            {
+              "node": "LINE Reply 病例確認",
+              "type": "main",
+              "index": 0
+            }
+          ],
+          [
+            {
+              "node": "是否需要重建病歷1",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "是否需要重建病歷1": {
+        "main": [
+          [
+            {
+              "node": "病歷資料收集1",
+              "type": "main",
+              "index": 0
+            }
+          ],
+          [
+            {
+              "node": "問診1",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Simple Memory5": {
+        "ai_memory": [
+          [
+            {
+              "node": "AI Agent1",
+              "type": "ai_memory",
+              "index": 0
+            },
+            {
+              "node": "清除病例確認記憶1",
+              "type": "ai_memory",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Ollama Chat Model5": {
+        "ai_languageModel": [
+          [
+            {
+              "node": "AI Agent1",
+              "type": "ai_languageModel",
+              "index": 0
+            },
+            {
+              "node": "Structured Output Parser5",
+              "type": "ai_languageModel",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "清除當次問診記憶1": {
+        "main": [
+          [
+            {
+              "node": "清除病例確認記憶1",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "清除病例確認記憶1": {
+        "main": [
+          [
+            {
+              "node": "清除病例收集記憶1",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "是否完成問診才清除記憶1": {
+        "main": [
+          [
+            {
+              "node": "清除當次問診記憶1",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "LINE Webhook": {
+        "main": [
+          [
+            {
+              "node": "LINE 驗證簽章",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "LINE 驗證簽章": {
+        "main": [
+          [
+            {
+              "node": "LINE 簽章有效",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "LINE 簽章有效": {
+        "main": [
+          [
+            {
+              "node": "LINE Normalize",
+              "type": "main",
+              "index": 0
+            }
+          ],
+          []
+        ]
+      },
+      "LINE Normalize": {
+        "main": [
+          [
+            {
+              "node": "檢視病例1",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      }
+    },
+    "settings": {
+      "executionOrder": "v1",
+      "binaryMode": "separate",
+      "availableInMCP": false,
+      "timeSavedMode": "fixed",
+      "callerPolicy": "workflowsFromSameOwner"
+    },
+    "nodeGroups": [],
+    "versionCounter": 1,
+    "triggerCount": 0,
+    "versionMetadata": {
+      "name": "LINE 醫療問診",
+      "description": null
+    }
+  }
+]
