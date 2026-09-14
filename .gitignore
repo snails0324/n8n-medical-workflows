@@ -1,0 +1,14 @@
+.env
+.n8n/
+.postgres/
+medical_corpus/
+node_modules/
+*.sqlite
+*.sqlite-*
+*.log
+*.bak*
+*.raw.json
+__pycache__/
+*.py[cod]
+*.pptx
+*.pdf
